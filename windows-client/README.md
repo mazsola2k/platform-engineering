@@ -292,11 +292,11 @@ The image contains the ROM and an entrypoint that copies it to `/dev/shm/` when 
 
 ```mermaid
 flowchart LR
-    ROM[/var/lib/kubevirt/\ngpu-03-00-0-legacyrom.rom] --> |copy into build context| CTX[hooks/gpu-romfile-hook/\nDockerfile + rom]
-    CTX --> |podman build| IMG[localhost/gpu-romfile-hook:latest]
-    IMG --> |ctr import → k8s.io| CRI[containerd\nk8s.io namespace]
-    CRI --> |imagePullPolicy: Never| POD[VM Pod Sidecar]
-    POD --> |cp rom → /dev/shm| QEMU[QEMU receives\nromfile path]
+    ROM["/var/lib/kubevirt/\ngpu-03-00-0-legacyrom.rom"] --> |copy into build context| CTX["hooks/gpu-romfile-hook/\nDockerfile + rom"]
+    CTX --> |podman build| IMG["localhost/gpu-romfile-hook:latest"]
+    IMG --> |ctr import to k8s.io| CRI["containerd\nk8s.io namespace"]
+    CRI --> |imagePullPolicy: Never| POD["VM Pod Sidecar"]
+    POD --> |cp rom to /dev/shm| QEMU["QEMU receives\nromfile path"]
 ```
 
 ---
@@ -505,66 +505,64 @@ flowchart TD
 ## Complete Lifecycle Diagram
 
 ```mermaid
-stateDiagram-v2
-    [*] --> HostSetup : First time only
+flowchart TD
+    subgraph HS["Host Setup (one-time)"]
+        direction TB
+        BIOS["Enable IOMMU in BIOS\nAMD: CBS → NBIO → IOMMU\nIntel: VT-d"]
+        GRUB["gpu-setup\nadd iommu=pt to BLS entries"]
+        Dracut["gpu-setup\nvfio-pci hook + modprobe config"]
+        KV1["gpu-setup\npatch KubeVirt PermittedHostDevices"]
+        RBT(["Reboot host"])
+        BIOS --> GRUB --> Dracut --> KV1 --> RBT
+    end
 
-    state HostSetup {
-        [*] --> BIOS : Enable IOMMU in BIOS
-        BIOS --> GRUB : gpu-setup: add iommu=pt to BLS entries
-        GRUB --> Dracut : gpu-setup: vfio-pci hook + modprobe config
-        Dracut --> KubeVirt : gpu-setup: patch PermittedHostDevices
-        KubeVirt --> [*] : Reboot host
-    }
+    subgraph WI["Windows 11 Install"]
+        direction TB
+        PV["Create PersistentVolumes"]
+        VM["Create VirtualMachine CRD"]
+        WPE["WinPE + Autounattend.xml"]
+        FB["Windows 11 installed\nWinRM HTTP enabled"]
+        PV --> VM --> WPE --> FB
+    end
 
-    HostSetup --> VGABios : Extract GPU ROM (TechPowerUp)
-    VGABios --> SidecarBuild : build-hook-image.yaml
-    SidecarBuild --> WindowsInstall : action=install
+    subgraph GC["GPU Claim"]
+        direction TB
+        SAI["Stop ollama / CUDA workloads"]
+        UNV["rmmod nvidia*"]
+        BVF["driver_override=vfio-pci\nbind to vfio-pci"]
+        SVM(["virtctl start win11client"])
+        SAI --> UNV --> BVF --> SVM
+    end
 
-    state WindowsInstall {
-        [*] --> PVCreate : Create PersistentVolumes
-        PVCreate --> VMCreate : Create VirtualMachine CRD
-        VMCreate --> WinSetup : WinPE + Autounattend.xml
-        WinSetup --> FirstBoot : Windows 11 installed
-        FirstBoot --> [*] : WinRM HTTP enabled
-    }
+    subgraph ND["NVIDIA Driver Install"]
+        direction TB
+        WRM["port-forward + wait_for 5985\nWinRM connected"]
+        DL["win_shell download\n~876 MB installer"]
+        SI["Silent install\n/s /n /noreboot /passive"]
+        VFY["nvidia-smi + registry verify\nDriver 591.86 confirmed"]
+        WRM --> DL --> SI --> VFY
+    end
 
-    WindowsInstall --> GPUClaim : action=gpu-claim
+    subgraph GR["GPU Release"]
+        direction TB
+        SVM2["virtctl stop win11client"]
+        UBV["Unbind vfio-pci\nclear driver_override"]
+        SBR["Secondary Bus Reset\nparent PCIe bridge reset"]
+        RBN["modprobe nvidia\nbind GPU to nvidia"]
+        RDM["Restart display manager\ngdm / sddm"]
+        SVM2 --> UBV --> SBR --> RBN --> RDM
+    end
 
-    state GPUClaim {
-        [*] --> StopAI : Stop ollama/CUDA workloads
-        StopAI --> UnloadNvidia : rmmod nvidia*
-        UnloadNvidia --> BindVfio : driver_override=vfio-pci
-        BindVfio --> [*] : virtctl start win11client
-    }
-
-    GPUClaim --> NvidiaDriver : action=nvidia-driver
-
-    state NvidiaDriver {
-        [*] --> WinRMConnect : port-forward + wait_for 5985
-        WinRMConnect --> Download : win_shell web download ~876 MB
-        Download --> SilentInstall : /s /n /noreboot /passive
-        SilentInstall --> Verify : nvidia-smi + registry
-        Verify --> [*] : Driver 591.86 confirmed
-    }
-
-    NvidiaDriver --> WindowsRunning : ✅ Full GPU Windows 11
-
-    state WindowsRunning {
-        [*] --> Using : RDP / gaming / workloads
-    }
-
-    WindowsRunning --> GPURelease : action=gpu-release
-
-    state GPURelease {
-        [*] --> StopVM : virtctl stop
-        StopVM --> UnbindVfio : clear driver_override
-        UnbindVfio --> SBR : Secondary Bus Reset
-        SBR --> RebindNvidia : modprobe nvidia + bind
-        RebindNvidia --> [*] : GPU back to Linux
-    }
-
-    GPURelease --> LinuxCUDA : nvidia-smi / ollama / CUDA
-    LinuxCUDA --> GPUClaim : Reclaim for Windows later
+    START([Start]) --> HS
+    HS --> VGAB["Extract GPU ROM\nTechPowerUp or nvflash"]
+    VGAB --> SCB["build-hook-image.yaml\nbuild ROM sidecar container"]
+    SCB --> WI
+    WI --> GC
+    GC --> ND
+    ND --> WIN(["Windows 11 running\nRTX 3090 + Driver 591.86"])
+    WIN --> GR
+    GR --> LCUDA(["GPU back to Linux\nnvidia-smi / ollama / CUDA"])
+    LCUDA -->|"Reclaim for Windows later"| GC
 ```
 
 ---
