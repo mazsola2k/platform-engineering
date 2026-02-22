@@ -1,0 +1,272 @@
+# Windows 11 Client Automation Tasks
+# ====================================
+# Post-install automation tasks executed over WinRM.
+# Connects via HTTP (port 5985, basic/unencrypted) which is configured by
+# the Autounattend FirstLogonCommands on all installs.
+# After connecting it automatically upgrades to HTTPS for future runs.
+#
+# Called by windows-client-controller.yaml — do not run directly.
+#
+# Supported automation_task values (set by controller):
+#   nvidia-driver   Download and silently install the latest NVIDIA Game Ready Driver
+#                   Installs: GPU driver + NVIDIA Control Panel + NGX (DLSS)
+#                   Does NOT install GeForce Experience (no account required)
+#
+# Key variables (all optional, inherit from controller):
+#   vm_name                 VM name (default: win11client)
+#   kubevirt_namespace      Namespace (default: default)
+#   windows_admin_password  Administrator password (default: SecureP@ssw0rd!)
+#   nvidia_gpu_pfid         NVIDIA product family ID for driver search (default: 891 = RTX 3090)
+#   nvidia_os_id            NVIDIA OS ID (default: 135 = Windows 11 64-bit)
+#   nvidia_dch              Use DCH driver package (default: 1 — modern systems)
+
+- name: Set automation defaults
+  ansible.builtin.set_fact:
+    kubevirt_namespace: "{{ kubevirt_namespace | default('default') }}"
+    vm_name: "{{ vm_name | default('win11client') }}"
+    windows_admin_password: "{{ windows_admin_password | default('SecureP@ssw0rd!') }}"
+    nvidia_gpu_pfid: "{{ nvidia_gpu_pfid | default('891') }}"     # 891 = GeForce RTX 3090
+    nvidia_os_id: "{{ nvidia_os_id | default('135') }}"           # 135 = Windows 11 64-bit
+    nvidia_dch: "{{ nvidia_dch | default('1') }}"                 # 1 = DCH (modern driver package)
+  tags: always
+
+# -----------------------------------------------------------------------
+# WinRM connectivity — HTTP (port 5985, basic/unencrypted)
+# This is always available: Order 4 in Autounattend enables it on all installs.
+# -----------------------------------------------------------------------
+- name: Kill any stale WinRM port-forwards
+  ansible.builtin.shell: |
+    pkill -f "kubectl.*port-forward.*win11client-winrm" 2>/dev/null || true
+    sleep 1
+  ignore_errors: true
+
+- name: Start WinRM HTTP port-forward via library script (setsid — survives task exit)
+  ansible.builtin.shell: |
+    bash "{{ playbook_dir }}/library/start_portforward.sh" \
+      "{{ vm_name }}-winrm" \
+      5985 \
+      "{{ kubevirt_namespace }}" \
+      /tmp/winrm-pf.log \
+      /tmp/winrm-pf.pid
+    sleep 4
+  ignore_errors: true
+
+- name: Wait for WinRM HTTP port to be reachable
+  ansible.builtin.wait_for:
+    host: localhost
+    port: 5985
+    timeout: 60
+    delay: 2
+
+- name: Set WinRM HTTP connection vars
+  ansible.builtin.set_fact:
+    _winrm: &winrm_vars
+      ansible_connection: winrm
+      ansible_user: Administrator
+      ansible_password: "{{ windows_admin_password }}"
+      ansible_host: localhost
+      ansible_winrm_transport: basic
+      ansible_winrm_server_cert_validation: ignore
+      ansible_winrm_port: 5985
+      ansible_winrm_scheme: http
+  no_log: true
+
+- name: Confirm WinRM connectivity — get hostname
+  ansible.windows.win_command:
+    cmd: hostname
+  register: win_hostname
+  become: false
+  vars: *winrm_vars
+
+- name: Display connected VM hostname
+  ansible.builtin.debug:
+    msg: "✅ Connected to Windows VM: {{ win_hostname.stdout | trim }}"
+
+# -----------------------------------------------------------------------
+# NVIDIA Game Ready Driver — latest for RTX 3090, Windows 11, silent install
+# (runs when automation_task == 'nvidia-driver')
+# -----------------------------------------------------------------------
+
+- name: "[nvidia-driver] Ensure C:\\Data\\temp directory exists"
+  ansible.windows.win_file:
+    path: C:\Data\temp
+    state: directory
+  become: false
+  vars: *winrm_vars
+  when: automation_task == 'nvidia-driver'
+
+- name: "[nvidia-driver] Write driver info — version {{ nvidia_driver_version }}"
+  ansible.windows.win_shell: |
+    [System.IO.File]::WriteAllText(
+      "C:\Data\nvidia_driver_info.txt",
+      "VERSION={{ nvidia_driver_version }}`nDOWNLOAD_URL={{ nvidia_driver_url }}`n"
+    )
+    Write-Host "Driver version : {{ nvidia_driver_version }}"
+    Write-Host "Download URL   : {{ nvidia_driver_url }}"
+    Write-Host "DONE"
+  become: false
+  vars: *winrm_vars
+  when: automation_task == 'nvidia-driver'
+
+- name: "[nvidia-driver] Download latest NVIDIA driver package"
+  ansible.windows.win_shell: |
+    $ErrorActionPreference = 'Stop'
+    $info  = Get-Content "C:\Data\nvidia_driver_info.txt"
+    $version     = ($info | Where-Object { $_ -match '^VERSION=' }) -replace '^VERSION=', ''
+    $downloadUrl = ($info | Where-Object { $_ -match '^DOWNLOAD_URL=' }) -replace '^DOWNLOAD_URL=', ''
+
+    $destPath = "C:\Data\temp\nvidia-driver-$version.exe"
+
+    if (Test-Path $destPath) {
+      Write-Host "Driver already downloaded: $destPath"
+    } else {
+      Write-Host "Downloading NVIDIA driver $version from: $downloadUrl"
+      $wc = New-Object System.Net.WebClient
+      $wc.DownloadFile($downloadUrl, $destPath)
+      Write-Host "Download complete: $destPath ($(([math]::Round((Get-Item $destPath).Length/1MB, 1))) MB)"
+    }
+
+    # Write the path so the install step can find it
+    Add-Content "C:\Data\nvidia_driver_info.txt" "LOCAL_PATH=$destPath"
+    Write-Host "DONE"
+  register: nvidia_download_result
+  become: false
+  vars: *winrm_vars
+  when: automation_task == 'nvidia-driver'
+  # Driver ~650 MB — generous timeout
+  async: 900
+  poll: 20
+
+- name: "[nvidia-driver] Show download result"
+  ansible.builtin.debug:
+    msg: "{{ nvidia_download_result.stdout_lines }}"
+  when: automation_task == 'nvidia-driver'
+
+- name: "[nvidia-driver] Silent install — GPU driver + NVIDIA Control Panel + NGX (no GeForce Experience)"
+  ansible.windows.win_shell: |
+    $ErrorActionPreference = 'Stop'
+    $info     = Get-Content "C:\Data\nvidia_driver_info.txt"
+    $localPath = ($info | Where-Object { $_ -match '^LOCAL_PATH=' }) -replace '^LOCAL_PATH=', ''
+
+    if (-not (Test-Path $localPath)) {
+      Write-Error "Driver installer not found at: $localPath"
+      exit 1
+    }
+
+    $version = ($info | Where-Object { $_ -match '^VERSION=' }) -replace '^VERSION=', ''
+    Write-Host "Installing NVIDIA driver $version from: $localPath"
+    Write-Host "Components: Display.Driver NVCP NGX NvDLSS (no GeForce Experience)"
+
+    # /s = silent, /n = no reboot, /noreboot = suppress reboot prompt
+    # /NOFINISH = no finish dialog, /passive = passive UI
+    # Components: GPU driver + NVIDIA Control Panel + NGX (DLSS) — no GFE sign-in required
+    $args = '/s /n /noreboot /NOFINISH /passive /Components:"Display.Driver NVCP NGX NvDLSS"'
+    $proc = Start-Process -FilePath $localPath -ArgumentList $args -Wait -PassThru -NoNewWindow
+
+    Write-Host "Installer exit code: $($proc.ExitCode)"
+
+    switch ($proc.ExitCode) {
+      0       { Write-Host "✅ NVIDIA driver installed successfully" }
+      1       { Write-Host "✅ NVIDIA driver installed (reboot required but suppressed)" }
+      default { Write-Host "⚠️  Installer returned exit code $($proc.ExitCode) — check NVIDIA setup logs" }
+    }
+    Write-Host "DONE"
+  register: nvidia_install_result
+  become: false
+  vars: *winrm_vars
+  when: automation_task == 'nvidia-driver'
+  # Driver install takes 3-8 minutes
+  async: 900
+  poll: 20
+
+- name: "[nvidia-driver] Show install result"
+  ansible.builtin.debug:
+    msg: "{{ nvidia_install_result.stdout_lines }}"
+  when: automation_task == 'nvidia-driver'
+
+- name: "[nvidia-driver] Verify NVIDIA driver installed — check GPU device"
+  ansible.windows.win_shell: |
+    $ErrorActionPreference = 'SilentlyContinue'
+
+    # Check via nvidia-smi first (most reliable)
+    $nvidiaSmi = "C:\Windows\System32\DriverStore\FileRepository\nv*\nvidia-smi.exe"
+    $smiPath = Get-ChildItem -Path "C:\Windows\System32\DriverStore\FileRepository" -Filter "nvidia-smi.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName
+    if (-not $smiPath) {
+      $smiPath = "$env:SystemRoot\System32\nvidia-smi.exe"
+    }
+
+    if (Test-Path $smiPath) {
+      Write-Host "=== nvidia-smi output ==="
+      & $smiPath
+    } else {
+      Write-Host "nvidia-smi not found in DriverStore (may need reboot to complete install)"
+    }
+
+    # Check device manager / PnP
+    Write-Host "`n=== GPU Device (PnP) ==="
+    Get-PnpDevice | Where-Object { $_.FriendlyName -match 'NVIDIA' -and $_.Class -eq 'Display' } |
+      Select-Object FriendlyName, Status, DriverVersion | Format-List
+
+    # Check installed driver version from registry
+    Write-Host "`n=== Driver Version (Registry) ==="
+    $reg = Get-ItemProperty "HKLM:\SOFTWARE\NVIDIA Corporation\Global\GMU" -ErrorAction SilentlyContinue
+    if ($reg) {
+      Write-Host "Version: $($reg.DriverVersion)"
+    } else {
+      Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4D36E968-E325-11CE-BFC1-08002BE10318}\0*" `
+        -Name DriverDesc, DriverVersion -ErrorAction SilentlyContinue |
+        Where-Object { $_.DriverDesc -match 'NVIDIA' } |
+        Select-Object DriverDesc, DriverVersion | Format-List
+    }
+  register: nvidia_verify_result
+  become: false
+  vars: *winrm_vars
+  when: automation_task == 'nvidia-driver'
+  ignore_errors: true
+
+- name: "[nvidia-driver] Show verification result"
+  ansible.builtin.debug:
+    msg: "{{ nvidia_verify_result.stdout_lines | default(['No output']) }}"
+  when: automation_task == 'nvidia-driver'
+
+- name: "[nvidia-driver] Clean up downloaded installer"
+  ansible.windows.win_shell: |
+    $info = Get-Content "C:\Data\nvidia_driver_info.txt" -ErrorAction SilentlyContinue
+    $localPath = ($info | Where-Object { $_ -match '^LOCAL_PATH=' }) -replace '^LOCAL_PATH=', ''
+    if ($localPath -and (Test-Path $localPath)) {
+      Remove-Item $localPath -Force
+      Write-Host "Removed: $localPath"
+    }
+    Remove-Item "C:\Data\nvidia_driver_info.txt" -Force -ErrorAction SilentlyContinue
+  register: nvidia_cleanup_result
+  become: false
+  vars: *winrm_vars
+  when: automation_task == 'nvidia-driver'
+  ignore_errors: true
+
+# -----------------------------------------------------------------------
+# Teardown — stop port-forward
+# -----------------------------------------------------------------------
+- name: Stop WinRM port-forward
+  ansible.builtin.shell: |
+    if [ -f /tmp/winrm-pf.pid ]; then
+      kill $(cat /tmp/winrm-pf.pid) 2>/dev/null || true
+      rm -f /tmp/winrm-pf.pid
+    fi
+    pkill -f "kubectl.*port-forward.*5985" 2>/dev/null || true
+  ignore_errors: true
+
+# -----------------------------------------------------------------------
+# Summary
+# -----------------------------------------------------------------------
+- name: Display automation summary
+  ansible.builtin.debug:
+    msg:
+      - "✅ Windows 11 automation task '{{ automation_task }}' complete"
+      - "   VM      : {{ vm_name }} ({{ kubevirt_namespace }})"
+      - "   Host    : {{ win_hostname.stdout | default('unknown') | trim }}"
+      - >-
+          {{
+            '   Driver  : ' + (nvidia_verify_result.stdout_lines | default(['']) | join(' ') | regex_search('\\d+\\.\\d+') | default('see output above') | string)
+            if automation_task == 'nvidia-driver' else ''
+          }}

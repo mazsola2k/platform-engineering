@@ -16,6 +16,38 @@
 # Usage — release GPU back to Fedora desktop/AI (vfio-pci → nvidia, no reboot):
 #   ansible-playbook windows-client-controller.yaml -e action=gpu-release
 #
+# ─────────────────────────────────────────────────────────────────────────────
+# REQUIRED: GPU VGA BIOS ROM FILE
+# ─────────────────────────────────────────────────────────────────────────────
+# The VM requires the real GPU BIOS ROM to prevent NVIDIA Code 43.
+# QEMU injects it via PCI BAR6; the KubeVirt hook sidecar (hooks/build-hook-image.yaml)
+# copies it to /dev/shm at VM startup.
+#
+# ROM file must be placed at:  /var/lib/kubevirt/gpu-03-00-0-legacyrom.rom
+#
+# Option A — TechPowerUp VGA BIOS Collection (recommended):
+#   1. Go to: https://www.techpowerup.com/vgabios/
+#   2. Filter: GPU model = "GeForce RTX 3090", match your board vendor + memory config
+#   3. Match the BIOS Version shown by: nvidia-smi --query-gpu=vbios_version --format=csv,noheader
+#   4. Download and verify:
+#        file your-gpu.rom   # Must show: PCI ROM ... NVIDIA Video BIOS
+#   5. sudo cp your-gpu.rom /var/lib/kubevirt/gpu-03-00-0-legacyrom.rom
+#
+#   TechPowerUp SubVendor IDs to narrow search (from: lspci -v -s 03:00.0):
+#     ASUS/Strix:    1043  |  EVGA: 3842  |  MSI: 1462  |  Gigabyte: 1458  |  Zotac: 19da
+#
+# Option B — Extract live from running GPU (nvidia driver must be active):
+#   sudo cat /sys/bus/pci/devices/0000:03:00.0/rom > /var/lib/kubevirt/gpu-03-00-0-legacyrom.rom
+#
+# Option C — nvflash (Windows or Linux, GPU must be idle):
+#   Download nvflash: https://www.techpowerup.com/download/nvidia-nvflash/
+#   Windows: .\nvflash64.exe --save gpu_bios.rom
+#   Linux:   sudo ./nvflash --save /var/lib/kubevirt/gpu-03-00-0-legacyrom.rom
+#
+# After placing the ROM, build the hook sidecar image:
+#   ansible-playbook windows-client/hooks/build-hook-image.yaml
+# ─────────────────────────────────────────────────────────────────────────────
+#
 # Variables (all have defaults):
 #   gpu_pci_slot         PCI address of GPU VGA function   (default: 0000:03:00.0)
 #   gpu_audio_slot       PCI address of GPU audio function  (default: 0000:03:00.1)

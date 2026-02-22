@@ -549,9 +549,15 @@
                   </SynchronousCommand>
                   <SynchronousCommand wcm:action="add">
                     <Order>4</Order>
-                    <Description>Enable WinRM and open firewall ports</Description>
+                    <Description>Enable WinRM HTTP and open firewall ports</Description>
                     <RequiresUserInput>false</RequiresUserInput>
                     <CommandLine>powershell -Command "winrm quickconfig -quiet; winrm set winrm/config/service '@{AllowUnencrypted=\"true\"}'; winrm set winrm/config/service/auth '@{Basic=\"true\"}'; Enable-PSRemoting -Force -SkipNetworkProfileCheck; New-NetFirewallRule -DisplayName 'Allow RDP' -Direction Inbound -Protocol TCP -LocalPort 3389 -Action Allow -Profile Any; New-NetFirewallRule -DisplayName 'Allow WinRM HTTP' -Direction Inbound -Protocol TCP -LocalPort 5985 -Action Allow -Profile Any"</CommandLine>
+                  </SynchronousCommand>
+                  <SynchronousCommand wcm:action="add">
+                    <Order>5</Order>
+                    <Description>Enable WinRM HTTPS with self-signed certificate on port 5986</Description>
+                    <RequiresUserInput>false</RequiresUserInput>
+                    <CommandLine>powershell -Command "$cert = New-SelfSignedCertificate -DnsName 'localhost',$env:COMPUTERNAME -CertStoreLocation 'cert:\LocalMachine\My' -NotAfter (Get-Date).AddYears(10); try { winrm delete winrm/config/Listener?Address=*+Transport=HTTPS } catch {}; winrm create winrm/config/Listener?Address=*+Transport=HTTPS \"@{Hostname='localhost';CertificateThumbprint='$($cert.Thumbprint)'}\"; winrm set winrm/config/service/auth '@{Certificate=\"true\"}'; New-NetFirewallRule -DisplayName 'Allow WinRM HTTPS' -Direction Inbound -Protocol TCP -LocalPort 5986 -Action Allow -Profile Any; Restart-Service WinRM"</CommandLine>
                   </SynchronousCommand>
                 </FirstLogonCommands>
               </component>
@@ -793,8 +799,10 @@
 # ============================================================
 - name: Deploy Windows 11 VM
   block:
-    - name: Enable KubeVirt GPU feature gate
-      # Required for gpus: device passthrough. Idempotent — safe to run every time.
+    - name: Enable KubeVirt GPU and Sidecar feature gates
+      # GPU: required for gpus: device passthrough.
+      # Sidecar: required for hooks.kubevirt.io/hookSidecars annotation.
+      # Idempotent — safe to run every time.
       kubernetes.core.k8s:
         state: present
         definition:
@@ -808,6 +816,7 @@
               developerConfiguration:
                 featureGates:
                   - GPU
+                  - Sidecar
       when: enable_gpu | default(false) | bool
 
     - name: Build VirtualMachine definition (UEFI, Windows 11)
@@ -970,39 +979,29 @@
           }}
       when: enable_gpu | default(false) | bool
 
-    - name: Prepare GPU romfile hook sidecar vars
-      # Builds the hookSidecars JSON annotation and the hostPath volume object
-      # so they can be combined into the VM definition in the next task.
+    - name: Prepare GPU romfile hook sidecar annotation
+      # Builds the hookSidecars JSON annotation.  The ROM file is baked into the
+      # container image (see Dockerfile) so no extra volume mount is needed.
+      # The sidecar copies the ROM to /dev/shm at startup — shared across all
+      # containers in the pod via the IPC namespace.
       # gpu_hook_image: override with -e gpu_hook_image=myregistry/gpu-romfile-hook:v1
-      # gpu_hook_rom:   override rom path inside the sidecar container
       ansible.builtin.set_fact:
         _hook_sidecars_json: >-
           {{ [
             {
               'image': gpu_hook_image | default('localhost/gpu-romfile-hook:latest'),
-              'imagePullPolicy': 'Never',
-              'volumeMounts': [
-                {
-                  'name': 'gpu-rom',
-                  'mountPath': '/var/lib/kubevirt'
-                }
-              ]
+              'imagePullPolicy': 'Never'
             }
           ] | to_json }}
-        _gpu_rom_volume:
-          name: gpu-rom
-          hostPath:
-            path: /var/lib/kubevirt
-            type: Directory
       when: enable_gpu | default(false) | bool
 
-    - name: Inject GPU romfile hook annotation and ROM hostPath volume into VM definition
+    - name: Inject GPU romfile hook annotation into VM definition
       # hooks.kubevirt.io/hookSidecars annotation triggers KubeVirt to run the sidecar
       # alongside virt-launcher. The sidecar's OnDefineDomain gRPC call injects
-      #   <rom file='/var/lib/kubevirt/gpu-03-00-0-legacyrom.rom'/>
+      #   <rom file='/dev/shm/gpu-03-00-0-legacyrom.rom'/>
       # into the GPU <hostdev> element before QEMU starts — equivalent to
       #   -device vfio-pci,...,romfile=...
-      # The gpu-rom hostPath volume makes the ROM file accessible inside the sidecar.
+      # No extra volumes needed — ROM is baked into the image and shared via /dev/shm.
       ansible.builtin.set_fact:
         vm_definition: >-
           {{
@@ -1013,9 +1012,6 @@
                     'annotations': {
                       'hooks.kubevirt.io/hookSidecars': _hook_sidecars_json
                     }
-                  },
-                  'spec': {
-                    'volumes': vm_definition.spec.template.spec.volumes + [_gpu_rom_volume]
                   }
                 }
               }
@@ -1072,7 +1068,7 @@
                 targetPort: 3389
                 protocol: TCP
 
-    - name: Create WinRM access service (ClusterIP)
+    - name: Create WinRM HTTP access service (ClusterIP)
       kubernetes.core.k8s:
         state: present
         definition:
@@ -1091,6 +1087,27 @@
               - name: winrm
                 port: 5985
                 targetPort: 5985
+                protocol: TCP
+
+    - name: Create WinRM HTTPS access service (ClusterIP)
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: "{{ vm_name }}-winrm-https"
+            namespace: "{{ kubevirt_namespace }}"
+            labels:
+              app: "{{ vm_name }}"
+          spec:
+            type: ClusterIP
+            selector:
+              kubevirt.io/vm: "{{ vm_name }}"
+            ports:
+              - name: winrm-https
+                port: 5986
+                targetPort: 5986
                 protocol: TCP
 
     - name: Wait for VM to be created

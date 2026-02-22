@@ -1,6 +1,7 @@
 ---
 # Windows Client Controller
 # Manages Windows 11 KubeVirt VM lifecycle (install / uninstall / reinstall / status).
+# Full documentation with architecture diagrams: windows-client/README.md
 #
 # Usage:
 #   ansible-playbook windows-client-controller.yaml -e action=install
@@ -30,6 +31,8 @@
 #   gpu_audio_id         GPU audio vendor:device PCI IDs (default: 10de:1aef)
 #   gpu_confirm          Skip interactive confirmation in gpu-setup (default: no)
 #   gpu_action           Internal: set by controller per action (setup/claim/release)
+#   nvidia_driver_version  NVIDIA driver version to install (default: 591.86)
+#   nvidia_driver_url      Direct download URL for the NVIDIA driver .exe
 #   windows 11 urls      https://www.windowscentral.com/microsoft/windows-11/microsofts-official-windows-11-version-25h2-rtm-iso-media-is-now-available-download-all-28-languages-here-for-x64-or-arm64
 
 - name: Windows Client Controller
@@ -38,6 +41,9 @@
   vars:
     kubevirt_operator_namespace: "kubevirt"
     ansible_python_interpreter: /opt/kubevirt-ansible-venv/bin/python
+    # NVIDIA Game Ready Driver — update these when a new driver is released
+    nvidia_driver_version: "591.86"
+    nvidia_driver_url: "https://uk.download.nvidia.com/Windows/591.86/591.86-desktop-win10-win11-64bit-international-dch-whql.exe"
 
   tasks:
     - name: Set default variables
@@ -57,7 +63,7 @@
     - name: Validate action parameter
       ansible.builtin.fail:
         msg: "Invalid action '{{ action }}'. Must be one of: install, uninstall, reinstall, reinstall-nogpu, install-nogpu, status"
-      when: action not in ['install', 'uninstall', 'reinstall', 'reinstall-nogpu', 'install-nogpu', 'status', 'gpu-setup', 'gpu-claim', 'gpu-release']
+      when: action not in ['install', 'uninstall', 'reinstall', 'reinstall-nogpu', 'install-nogpu', 'status', 'gpu-setup', 'gpu-claim', 'gpu-release', 'nvidia-driver']
 
     - name: Display controller banner
       ansible.builtin.debug:
@@ -111,6 +117,13 @@
         gpu_action: release
       when: action == 'gpu-release'
 
+    # Post-install automation tasks (runs over WinRM HTTPS)
+    - name: Execute Windows 11 post-install automation
+      ansible.builtin.include_tasks: windows-client/windows11-automation.yaml
+      vars:
+        automation_task: "{{ action }}"
+      when: action in ['nvidia-driver']
+
     # Reinstall (uninstall then install)
     - name: Execute Windows 11 reinstallation
       block:
@@ -148,6 +161,7 @@
           - "  GPU Setup: ansible-playbook windows-client-controller.yaml -e action=gpu-setup"
           - "  GPU Claim: ansible-playbook windows-client-controller.yaml -e action=gpu-claim"
           - "  GPU Rel:   ansible-playbook windows-client-controller.yaml -e action=gpu-release"
+          - "  NVIDIA Drv: ansible-playbook windows-client-controller.yaml -e action=nvidia-driver"
           - ""
           - "Custom options:"
           - "  -e vm_name=mywin11          Custom VM name"
