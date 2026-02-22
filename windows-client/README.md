@@ -18,8 +18,9 @@ End-to-end guide for running a Windows 11 VM under Kubernetes/KubeVirt with a de
 10. [Phase 6 — NVIDIA Driver Installation (WinRM)](#phase-6--nvidia-driver-installation-winrm)
 11. [Phase 7 — Release GPU Back to Linux](#phase-7--release-gpu-back-to-linux)
 12. [Updating the NVIDIA Driver](#updating-the-nvidia-driver)
-13. [Troubleshooting](#troubleshooting)
-14. [File Reference](#file-reference)
+13. [Under the Hood — KubeVirt IS QEMU](#under-the-hood--kubevirt-is-qemu)
+14. [Troubleshooting](#troubleshooting)
+15. [File Reference](#file-reference)
 
 ---
 
@@ -64,7 +65,7 @@ End-to-end guide for running a Windows 11 VM under Kubernetes/KubeVirt with a de
 | Kubernetes cluster | Single-node or multi-node, Fedora recommended |
 | KubeVirt installed | `ansible-playbook k8s-redhat-kubevirt-controller.yaml -e action=install` |
 | IOMMU enabled in BIOS | AMD: CBS → NBIO → IOMMU = Enabled. Intel: VT-d. |
-| Two NVIDIA GPUs | One for Linux (AI/CUDA), one to pass through to Windows |
+| Two GPUs (display outputs) | **Required** — one GPU must always drive the Linux host display/CUDA while the other is passed to the Windows VM. Supported configurations: **(a)** two discrete NVIDIA GPUs (this guide's primary target), **(b)** one CPU-integrated GPU (Intel/AMD iGPU) for Linux display + one discrete NVIDIA GPU for passthrough. AMD discrete GPUs can also be passed through but VBIOS ROM handling and driver workarounds differ — this guide covers NVIDIA passthrough only. |
 | virtctl installed | Required for VM start/stop/VNC access |
 | ansible-collection `kubernetes.core` | `ansible-galaxy install -r requirements.yml` |
 | `virtio-win.iso` | Downloaded automatically during install |
@@ -564,6 +565,122 @@ flowchart TD
     GR --> LCUDA(["GPU back to Linux\nnvidia-smi / ollama / CUDA"])
     LCUDA -->|"Reclaim for Windows later"| GC
 ```
+
+---
+
+## Under the Hood — KubeVirt IS QEMU
+
+### Background
+
+Before committing to KubeVirt, this setup was prototyped using a raw QEMU/KVM playbook:
+[`windows11-kvm-test.yaml`](windows11-kvm-test.yaml). That playbook builds and launches the exact
+same `qemu-system-x86_64` command line manually, giving full visibility into every parameter before
+translating it to KubeVirt CRD fields.
+
+**The key insight is: KubeVirt does not replace QEMU. It orchestrates it.**
+
+The KubeVirt operator reads a `VirtualMachine` CRD, converts it to a libvirt XML domain definition,
+and hands that to `libvirtd`, which then spawns `qemu-system-x86_64` with the appropriate
+command-line flags — exactly the same flags the test playbook constructed by hand.
+
+```
+                  ┌────────────────────────┐
+  KubeVirt CRD    │   virt-controller      │──→ schedules virt-launcher pod
+  (YAML fields)   └────────────────────────┘
+        ↓                      ↓
+  ┌─────────────┐    ┌──────────────────────┐
+  │ libvirt XML │←───│  virt-launcher pod   │  (one pod per VM)
+  └─────────────┘    └──────────────────────┘
+        ↓
+  qemu-system-x86_64 <flags>   ← same binary · same flags · same VFIO passthrough
+```
+
+Refer to [`windows11-kvm-test.yaml`](windows11-kvm-test.yaml) to see the raw QEMU command that was
+built and tested first. The KubeVirt CRD in [`windows11-install.yaml`](windows11-install.yaml) is
+essentially the same command expressed as structured YAML managed by Kubernetes.
+
+---
+
+### QEMU → KubeVirt Parameter Translation
+
+| QEMU / libvirt flag | KubeVirt YAML field | Notes |
+|---|---|---|
+| `-machine q35,accel=kvm` | `domain.machine.type: q35` | Q35 chipset; `accel=kvm` always on |
+| `kernel-irqchip=on` | `features.ioapic.driver: kvm` | Correct IRQ routing for PCIe passthrough |
+| `-cpu host` | `cpu.model: host-passthrough` | Exposes all host CPU features to guest |
+| `+topoext,+invtsc` | `cpu.features[]` | NUMA topology + invariant TSC |
+| `kvm=off` | `features.kvm.hidden: true` | Hides KVM CPUID — prevents NVIDIA Code 43 |
+| `hv_vendor_id=ntg0npov91om` | `features.hyperv.vendorid: ntg0npov91om` | Spoofs hypervisor vendor — second anti-detection layer |
+| `hv_relaxed` | `features.hyperv.relaxed: {}` | Relaxed timer — reduces guest BSOD risk |
+| `hv_spinlocks=0x1000` | `features.hyperv.spinlocks.retries: 8191` | Spinlock retry count |
+| `hv_vapic` | `features.hyperv.vapic: {}` | Virtual APIC |
+| `hv_time,hv_runtime,hv_synic,hv_reset,hv_vpindex,hv_tlbflush,hv_ipi` | `features.hyperv.{freqs,runtime,synic,reset,vpindex,tlbflush,ipi}: {}` | Hyper-V enlightenments for Windows performance |
+| `-drive if=pflash,...OVMF_CODE.fd` | `firmware.bootloader.efi.secureBoot: false` | UEFI via OVMF; KubeVirt manages VARS persistence |
+| _(implicit)_ | `firmware.smm.enabled: true` | System Management Mode (Windows 11 TPM requirement) |
+| `-device virtio-blk-pci,...` | `devices.disks[].disk.bus: virtio` | VirtIO block device |
+| `-device virtio-net-pci,...` | `devices.interfaces[].model: virtio` | VirtIO NIC |
+| `-device usb-tablet` | `devices.inputs[].type: tablet, bus: usb` | Absolute mouse — prevents cursor capture |
+| `-device vfio-pci,host=03:00.0` | `devices.gpus[].deviceName: nvidia.com/RTX_3090` | GPU passthrough; PCI address resolved by device plugin |
+| `-device vfio-pci,host=03:00.1` | second entry in `devices.gpus[]` | GPU HDMI audio (same IOMMU group — must pass together) |
+
+---
+
+### ROM Injection — The One Parameter KubeVirt Cannot Express Directly
+
+The `romfile=` QEMU flag — used to supply a patched VGA BIOS to fix Code 43 — has **no equivalent
+CRD field** in KubeVirt. This is solved via the **hook sidecar** mechanism.
+
+**Direct QEMU (prototype in `windows11-kvm-test.yaml`):**
+```bash
+-device vfio-pci,host=03:00.0,multifunction=on,romfile=/path/to/gpu-03-00-0-legacyrom.rom
+```
+
+**KubeVirt equivalent — hook sidecar:**
+
+KubeVirt exposes a pre-start hook via the `hooks.kubevirt.io/hookSidecars` pod annotation.
+The sidecar container:
+
+1. Starts **before** `virt-launcher` spawns QEMU
+2. Implements the `OnDefineDomain` gRPC hook
+3. Receives the full libvirt XML domain definition
+4. Inserts `<rom file='/dev/shm/gpu-03-00-0-legacyrom.rom'/>` into the GPU `<hostdev>` element
+5. Returns the modified XML — QEMU then sees the `romfile=` parameter transparently
+
+The ROM is baked into the sidecar container image at build time (`build-hook-image.yaml`) and
+copied to `/dev/shm` at container startup. Because all containers in a pod share the same IPC
+namespace, `/dev/shm` is visible to `virt-launcher` / QEMU.
+
+```
+  VM Pod
+  ┌─────────────────────────────────────────────────────┐
+  │                                                     │
+  │  ┌──────────────────────────┐   /dev/shm/           │
+  │  │  gpu-romfile-hook        │──→ gpu-03-00-0-       │
+  │  │  (sidecar container)     │    legacyrom.rom      │
+  │  │                          │         │             │
+  │  │  OnDefineDomain gRPC:    │         │             │
+  │  │  inject <rom file=.../>  │         │             │
+  │  └──────────────────────────┘         │             │
+  │                                       ↓             │
+  │  ┌────────────────────────────────────────────────┐ │
+  │  │  virt-launcher → libvirt → qemu-system-x86_64  │ │
+  │  │  -device vfio-pci,host=03:00.0,romfile=        │ │
+  │  │              /dev/shm/gpu-03-00-0-legacyrom.rom│ │
+  │  └────────────────────────────────────────────────┘ │
+  └─────────────────────────────────────────────────────┘
+```
+
+The annotation injected by `windows11-install.yaml`:
+```yaml
+metadata:
+  annotations:
+    hooks.kubevirt.io/hookSidecars: |
+      [{"image": "localhost/gpu-romfile-hook:latest", "imagePullPolicy": "Never"}]
+```
+
+> **`imagePullPolicy: Never`** is required because the hook image is built locally and
+> imported into `containerd` under the `k8s.io` namespace on the node — it is never
+> pushed to an external registry.
 
 ---
 
