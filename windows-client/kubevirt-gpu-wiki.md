@@ -31,25 +31,16 @@ This project implements **runtime GPU reassignment** between a Linux host and Ku
 
 ---
 
-## The Utilisation Problem
+## The Problem
 
-A single NVIDIA RTX 3090 represents **$1,500+ of silicon** drawing 350 W at peak. In practice, most environments exhibit a recurring pattern:
+GPUs are the most expensive, most power-hungry components in a modern server — and in most environments, they sit idle the majority of the time. An ML team trains during business hours; the GPU does nothing overnight. An engineer's VM holds a GPU for CAD even while they're in meetings. A developer wants CUDA on Linux and a Windows desktop, but can't have both without rebooting or buying a second machine.
 
-| Scenario | GPU Active Window | Idle Window | Effective Utilisation |
-|:--|:--|:--|:--|
-| ML training (business hours) | 08:00 – 18:00 | 18:00 – 08:00 | **~42%** |
-| Engineering CAD workstation | Meeting-free hours | Meetings, EOD | **~30%** |
-| Inference serving (peak traffic) | 09:00 – 22:00 | 22:00 – 09:00 | **~54%** |
-| Batch rendering pipeline | Overnight runs | Daytime | **~33%** |
+The GPU is always **statically assigned** — locked to one workload, one OS, one VM. The usual fixes all fall short:
 
-The conventional mitigations each introduce their own cost:
-
-| Approach | Trade-off |
-|:--|:--|
-| Additional hardware | Capital expenditure scales linearly; idle time persists |
-| Static VM assignment | Host permanently loses GPU access |
-| Reboot to switch drivers | Minutes of downtime per transition; unacceptable for production |
-| NVIDIA vGPU / MIG | Per-GPU licensing fees, fractional performance, limited model support |
+- **Buy more hardware** — expensive, and the new GPU is idle just as often
+- **Permanently assign to VMs** — the host loses GPU access entirely
+- **Reboot to switch** — minutes of downtime per transition
+- **vGPU / MIG** — fractional performance, limited to specific GPU models
 
 **The alternative:** treat the GPU as a **time-multiplexed resource** that moves between consumers on demand.
 
