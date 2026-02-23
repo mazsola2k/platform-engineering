@@ -42,6 +42,24 @@ The GPU is always **statically assigned** — locked to one workload, one OS, on
 - **Reboot to switch** — minutes of downtime per transition
 - **vGPU / MIG** — fractional performance, limited to specific GPU models
 
+### Why Not SR-IOV?
+
+The enterprise approach to GPU sharing is **SR-IOV** (Single Root I/O Virtualisation) — a PCIe specification that allows a single physical device to present multiple Virtual Functions (VFs), each assignable to a different VM simultaneously. NVIDIA supports this on **datacenter-class GPUs only**: the A-series (A100, A30, A16), Quadro RTX enterprise cards, and the newer H100 / L40S. These GPUs expose a hardware-level partitioning capability that the hypervisor can allocate without full device passthrough.
+
+Consumer GeForce RTX cards — the 3090, 4090, and their siblings — **do not implement SR-IOV**. The firmware simply does not expose Virtual Functions. No driver or software configuration can change this; it is a hardware and firmware boundary.
+
+This project takes the alternative path: **full PCIe passthrough of a consumer RTX GPU** via VFIO. Instead of slicing one GPU into fractions shared across VMs concurrently, the entire physical device is reassigned between workloads **sequentially** — one consumer at a time, but switchable in seconds. The trade-off is explicit:
+
+| | SR-IOV (A-series / Quadro) | VFIO Passthrough (GeForce RTX) |
+|:--|:--|:--|
+| **Concurrent VMs per GPU** | Multiple (hardware-partitioned VFs) | One (exclusive device ownership) |
+| **Per-VM performance** | Fractional (VRAM and compute divided) | Full (every core, every byte of VRAM) |
+| **GPU hardware required** | Enterprise datacenter SKUs | Any discrete GPU with IOMMU support |
+| **Switching model** | Static partition at VM creation | Dynamic reassignment at runtime |
+| **Cost** | Enterprise GPU pricing | Consumer GPU pricing |
+
+For workloads that need the **complete, unpartitioned GPU** — gaming, full-resolution CAD, large model inference, single-VM rendering — passthrough on a consumer RTX card delivers what SR-IOV cannot: the entire device at native performance, at a fraction of the hardware cost.
+
 **The alternative:** treat the GPU as a **time-multiplexed resource** that moves between consumers on demand.
 
 ---
