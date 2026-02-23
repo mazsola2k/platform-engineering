@@ -741,6 +741,10 @@
       changed_when: true
       when: release_current_driver.stdout != 'nvidia'
 
+    # NOTE: Restarting the display manager kills the current Wayland/X session
+    # (and any running apps like VS Code). It is NOT required for nvidia-smi or
+    # CUDA workloads — the GPU is usable as soon as it's bound to the nvidia driver.
+    # Only restart if explicitly requested: -e restart_display=true
     - name: Restart display manager so Fedora desktop picks up the GPU
       ansible.builtin.shell:
         cmd: |
@@ -750,7 +754,9 @@
           echo "no display manager restarted"
       changed_when: false
       ignore_errors: true
-      when: release_current_driver.stdout != 'nvidia'
+      when:
+        - release_current_driver.stdout != 'nvidia'
+        - restart_display | default('false') | bool
 
     - name: Release summary
       ansible.builtin.debug:

@@ -3,7 +3,6 @@
 # Post-install automation tasks executed over WinRM.
 # Connects via HTTP (port 5985, basic/unencrypted) which is configured by
 # the Autounattend FirstLogonCommands on all installs.
-# After connecting it automatically upgrades to HTTPS for future runs.
 #
 # Called by windows-client-controller.yaml — do not run directly.
 #
@@ -28,6 +27,7 @@
     nvidia_gpu_pfid: "{{ nvidia_gpu_pfid | default('891') }}"     # 891 = GeForce RTX 3090
     nvidia_os_id: "{{ nvidia_os_id | default('135') }}"           # 135 = Windows 11 64-bit
     nvidia_dch: "{{ nvidia_dch | default('1') }}"                 # 1 = DCH (modern driver package)
+    nvidia_reinstall: "{{ nvidia_reinstall | default('false') }}" # 'true' = force reinstall even if driver present
   tags: always
 
 # -----------------------------------------------------------------------
@@ -51,12 +51,15 @@
     sleep 4
   ignore_errors: true
 
-- name: Wait for WinRM HTTP port to be reachable
-  ansible.builtin.wait_for:
-    host: localhost
-    port: 5985
-    timeout: 60
-    delay: 2
+- name: Wait for WinRM HTTP to actually respond (not just TCP)
+  ansible.builtin.shell: |
+    for i in $(seq 1 30); do
+      code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 3 http://localhost:5985/wsman 2>/dev/null)
+      [ "$code" != "000" ] && exit 0
+      sleep 2
+    done
+    echo "WinRM did not respond after 60s" >&2
+    exit 1
 
 - name: Set WinRM HTTP connection vars
   ansible.builtin.set_fact:
@@ -116,9 +119,20 @@
     $downloadUrl = ($info | Where-Object { $_ -match '^DOWNLOAD_URL=' }) -replace '^DOWNLOAD_URL=', ''
 
     $destPath = "C:\Data\temp\nvidia-driver-$version.exe"
+    $reinstall = '{{ nvidia_reinstall }}' -eq 'true'
 
-    if (Test-Path $destPath) {
+    if ((Test-Path $destPath) -and -not $reinstall) {
       Write-Host "Driver already downloaded: $destPath"
+    } elseif ((Test-Path $destPath) -and $reinstall) {
+      Write-Host "Reinstall requested — killing any running NVIDIA setup processes..."
+      Get-Process | Where-Object { $_.Name -match 'setup|nvidia|NvInstaller' } | Stop-Process -Force -ErrorAction SilentlyContinue
+      Start-Sleep -Seconds 3
+      Write-Host "Removing existing installer: $destPath"
+      Remove-Item $destPath -Force
+      Write-Host "Downloading NVIDIA driver $version from: $downloadUrl"
+      $wc = New-Object System.Net.WebClient
+      $wc.DownloadFile($downloadUrl, $destPath)
+      Write-Host "Download complete: $destPath ($(([math]::Round((Get-Item $destPath).Length/1MB, 1))) MB)"
     } else {
       Write-Host "Downloading NVIDIA driver $version from: $downloadUrl"
       $wc = New-Object System.Net.WebClient
@@ -142,10 +156,15 @@
     msg: "{{ nvidia_download_result.stdout_lines }}"
   when: automation_task == 'nvidia-driver'
 
-- name: "[nvidia-driver] Silent install — GPU driver + NVIDIA Control Panel + NGX (no GeForce Experience)"
+# ---- Fire-and-forget install ------------------------------------------------
+# The NVIDIA installer resets the GPU/network stack which kills WinRM.
+# We launch it detached (no -Wait), let the connection drop, wait locally
+# for the install to finish, then reconnect to verify.
+# ---------------------------------------------------------------------------
+- name: "[nvidia-driver] Launch installer (fire-and-forget — installer may reset network)"
   ansible.windows.win_shell: |
     $ErrorActionPreference = 'Stop'
-    $info     = Get-Content "C:\Data\nvidia_driver_info.txt"
+    $info      = Get-Content "C:\Data\nvidia_driver_info.txt"
     $localPath = ($info | Where-Object { $_ -match '^LOCAL_PATH=' }) -replace '^LOCAL_PATH=', ''
 
     if (-not (Test-Path $localPath)) {
@@ -154,35 +173,118 @@
     }
 
     $version = ($info | Where-Object { $_ -match '^VERSION=' }) -replace '^VERSION=', ''
-    Write-Host "Installing NVIDIA driver $version from: $localPath"
+    Write-Host "Launching NVIDIA driver $version installer (fire-and-forget)..."
     Write-Host "Components: Display.Driver NVCP NGX NvDLSS (no GeForce Experience)"
 
-    # /s = silent, /n = no reboot, /noreboot = suppress reboot prompt
-    # /NOFINISH = no finish dialog, /passive = passive UI
-    # Components: GPU driver + NVIDIA Control Panel + NGX (DLSS) — no GFE sign-in required
-    $args = '/s /n /noreboot /NOFINISH /passive /Components:"Display.Driver NVCP NGX NvDLSS"'
-    $proc = Start-Process -FilePath $localPath -ArgumentList $args -Wait -PassThru -NoNewWindow
+    # Fire-and-forget: Start-Process WITHOUT -Wait so the script returns immediately.
+    # The installer runs in the background; network may reset during install.
+    Start-Process -FilePath $localPath `
+      -ArgumentList '/s /n /noreboot /NOFINISH /Components:"Display.Driver NVCP NGX NvDLSS"' `
+      -PassThru | ForEach-Object {
+        Write-Host "Installer PID: $($_.Id)"
+        # Write PID so we can check later
+        [System.IO.File]::WriteAllText("C:\Data\nvidia_installer_pid.txt", "$($_.Id)")
+      }
 
-    Write-Host "Installer exit code: $($proc.ExitCode)"
-
-    switch ($proc.ExitCode) {
-      0       { Write-Host "✅ NVIDIA driver installed successfully" }
-      1       { Write-Host "✅ NVIDIA driver installed (reboot required but suppressed)" }
-      default { Write-Host "⚠️  Installer returned exit code $($proc.ExitCode) — check NVIDIA setup logs" }
-    }
+    Write-Host "Installer launched — returning immediately (WinRM may drop during install)"
     Write-Host "DONE"
   register: nvidia_install_result
   become: false
   vars: *winrm_vars
   when: automation_task == 'nvidia-driver'
-  # Driver install takes 3-8 minutes
-  async: 900
-  poll: 20
+  ignore_unreachable: true
+  ignore_errors: true
 
-- name: "[nvidia-driver] Show install result"
+- name: "[nvidia-driver] Show launch result"
   ansible.builtin.debug:
-    msg: "{{ nvidia_install_result.stdout_lines }}"
+    msg: "{{ nvidia_install_result.stdout_lines | default(['Installer launched (WinRM may have dropped)']) }}"
   when: automation_task == 'nvidia-driver'
+
+- name: "[nvidia-driver] Wait for installer to finish (local pause — 4 minutes)"
+  ansible.builtin.shell: |
+    echo "Waiting 240s for NVIDIA installer to complete on the VM..."
+    echo "The GPU driver install resets the display/network adapter — WinRM will be unavailable."
+    sleep 240
+    echo "Wait complete — will now reconnect."
+  when: automation_task == 'nvidia-driver'
+
+- name: "[nvidia-driver] Kill stale port-forward after install"
+  ansible.builtin.shell: |
+    pkill -f "kubectl.*port-forward.*win11client-winrm" 2>/dev/null || true
+    sleep 2
+  ignore_errors: true
+  when: automation_task == 'nvidia-driver'
+
+- name: "[nvidia-driver] Restart WinRM port-forward"
+  ansible.builtin.shell: |
+    bash "{{ playbook_dir }}/library/start_portforward.sh" \
+      "{{ vm_name }}-winrm" \
+      5985 \
+      "{{ kubevirt_namespace }}" \
+      /tmp/winrm-pf.log \
+      /tmp/winrm-pf.pid
+    sleep 4
+  when: automation_task == 'nvidia-driver'
+
+- name: "[nvidia-driver] Wait for WinRM to come back after install"
+  ansible.builtin.shell: |
+    echo "Waiting for WinRM to respond after driver install..."
+    for i in $(seq 1 60); do
+      code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 3 http://localhost:5985/wsman 2>/dev/null)
+      if [ "$code" != "000" ]; then
+        echo "WinRM back online (HTTP $code) after $((i*3))s"
+        exit 0
+      fi
+      sleep 3
+    done
+    echo "WinRM did not respond after 180s" >&2
+    exit 1
+  register: winrm_reconnect_result
+  when: automation_task == 'nvidia-driver'
+
+- name: "[nvidia-driver] Confirm WinRM reconnected"
+  ansible.windows.win_command:
+    cmd: hostname
+  register: win_hostname_post
+  become: false
+  vars: *winrm_vars
+  when: automation_task == 'nvidia-driver'
+
+- name: "[nvidia-driver] Check installer exit status"
+  ansible.windows.win_shell: |
+    # Check if the installer is still running
+    $pidFile = "C:\Data\nvidia_installer_pid.txt"
+    if (Test-Path $pidFile) {
+      $pid = [int](Get-Content $pidFile)
+      $proc = Get-Process -Id $pid -ErrorAction SilentlyContinue
+      if ($proc) {
+        Write-Host "⏳ Installer (PID $pid) is STILL RUNNING — waiting up to 10 more minutes..."
+        $proc | Wait-Process -Timeout 600 -ErrorAction SilentlyContinue
+        $proc = Get-Process -Id $pid -ErrorAction SilentlyContinue
+        if ($proc) {
+          Write-Host "⚠️  Installer still running after extended wait"
+        } else {
+          Write-Host "✅ Installer finished"
+        }
+      } else {
+        Write-Host "✅ Installer process (PID $pid) has already exited"
+      }
+      Remove-Item $pidFile -Force -ErrorAction SilentlyContinue
+    } else {
+      Write-Host "No PID file found — checking for running setup processes..."
+      $setup = Get-Process | Where-Object { $_.Name -match 'setup|NvInstaller' }
+      if ($setup) {
+        Write-Host "⏳ NVIDIA setup processes still running — waiting up to 10 minutes..."
+        $setup | Wait-Process -Timeout 600 -ErrorAction SilentlyContinue
+      } else {
+        Write-Host "✅ No NVIDIA setup processes running"
+      }
+    }
+  register: nvidia_exit_check
+  become: false
+  vars: *winrm_vars
+  when: automation_task == 'nvidia-driver'
+  ignore_errors: true
 
 - name: "[nvidia-driver] Verify NVIDIA driver installed — check GPU device"
   ansible.windows.win_shell: |

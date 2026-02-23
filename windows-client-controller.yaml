@@ -33,6 +33,7 @@
 #   gpu_action           Internal: set by controller per action (setup/claim/release)
 #   nvidia_driver_version  NVIDIA driver version to install (default: 591.86)
 #   nvidia_driver_url      Direct download URL for the NVIDIA driver .exe
+#   nvidia_reinstall       Set to 'true' to force re-download and reinstall even if already installed (default: false)
 #   windows 11 urls      https://www.windowscentral.com/microsoft/windows-11/microsofts-official-windows-11-version-25h2-rtm-iso-media-is-now-available-download-all-28-languages-here-for-x64-or-arm64
 
 - name: Windows Client Controller

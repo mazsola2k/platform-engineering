@@ -549,9 +549,9 @@
                   </SynchronousCommand>
                   <SynchronousCommand wcm:action="add">
                     <Order>4</Order>
-                    <Description>Enable WinRM and open firewall ports</Description>
+                    <Description>Enable WinRM HTTP and open firewall ports</Description>
                     <RequiresUserInput>false</RequiresUserInput>
-                    <CommandLine>powershell -Command "winrm quickconfig -quiet; winrm set winrm/config/service '@{AllowUnencrypted=\"true\"}'; winrm set winrm/config/service/auth '@{Basic=\"true\"}'; Enable-PSRemoting -Force -SkipNetworkProfileCheck; New-NetFirewallRule -DisplayName 'Allow RDP' -Direction Inbound -Protocol TCP -LocalPort 3389 -Action Allow -Profile Any; New-NetFirewallRule -DisplayName 'Allow WinRM HTTP' -Direction Inbound -Protocol TCP -LocalPort 5985 -Action Allow -Profile Any"</CommandLine>
+                    <CommandLine>powershell -Command "Get-NetConnectionProfile | Set-NetConnectionProfile -NetworkCategory Private; Enable-PSRemoting -Force; Set-Item WSMan:\localhost\Service\AllowUnencrypted -Value $true; Set-Item WSMan:\localhost\Service\Auth\Basic -Value $true; New-NetFirewallRule -DisplayName 'Allow RDP' -Direction Inbound -Protocol TCP -LocalPort 3389 -Action Allow -Profile Any; New-NetFirewallRule -DisplayName 'Allow WinRM HTTP' -Direction Inbound -Protocol TCP -LocalPort 5985 -Action Allow -Profile Any; Restart-Service WinRM"</CommandLine>
                   </SynchronousCommand>
                 </FirstLogonCommands>
               </component>

@@ -551,13 +551,13 @@
                     <Order>4</Order>
                     <Description>Enable WinRM HTTP and open firewall ports</Description>
                     <RequiresUserInput>false</RequiresUserInput>
-                    <CommandLine>powershell -Command "winrm quickconfig -quiet; winrm set winrm/config/service '@{AllowUnencrypted=\"true\"}'; winrm set winrm/config/service/auth '@{Basic=\"true\"}'; Enable-PSRemoting -Force -SkipNetworkProfileCheck; New-NetFirewallRule -DisplayName 'Allow RDP' -Direction Inbound -Protocol TCP -LocalPort 3389 -Action Allow -Profile Any; New-NetFirewallRule -DisplayName 'Allow WinRM HTTP' -Direction Inbound -Protocol TCP -LocalPort 5985 -Action Allow -Profile Any"</CommandLine>
+                    <CommandLine>powershell -Command "Get-NetConnectionProfile | Set-NetConnectionProfile -NetworkCategory Private; Enable-PSRemoting -Force; Set-Item WSMan:\localhost\Service\AllowUnencrypted -Value $true; Set-Item WSMan:\localhost\Service\Auth\Basic -Value $true; New-NetFirewallRule -DisplayName 'Allow RDP' -Direction Inbound -Protocol TCP -LocalPort 3389 -Action Allow -Profile Any; New-NetFirewallRule -DisplayName 'Allow WinRM HTTP' -Direction Inbound -Protocol TCP -LocalPort 5985 -Action Allow -Profile Any; Restart-Service WinRM"</CommandLine>
                   </SynchronousCommand>
                   <SynchronousCommand wcm:action="add">
                     <Order>5</Order>
                     <Description>Enable WinRM HTTPS with self-signed certificate on port 5986</Description>
                     <RequiresUserInput>false</RequiresUserInput>
-                    <CommandLine>powershell -Command "$cert = New-SelfSignedCertificate -DnsName 'localhost',$env:COMPUTERNAME -CertStoreLocation 'cert:\LocalMachine\My' -NotAfter (Get-Date).AddYears(10); try { winrm delete winrm/config/Listener?Address=*+Transport=HTTPS } catch {}; winrm create winrm/config/Listener?Address=*+Transport=HTTPS \"@{Hostname='localhost';CertificateThumbprint='$($cert.Thumbprint)'}\"; winrm set winrm/config/service/auth '@{Certificate=\"true\"}'; New-NetFirewallRule -DisplayName 'Allow WinRM HTTPS' -Direction Inbound -Protocol TCP -LocalPort 5986 -Action Allow -Profile Any; Restart-Service WinRM"</CommandLine>
+                    <CommandLine>powershell -Command "$cert = New-SelfSignedCertificate -DnsName 'localhost',$env:COMPUTERNAME -CertStoreLocation 'cert:\LocalMachine\My' -NotAfter (Get-Date).AddYears(10); try { Remove-WSManInstance winrm/config/Listener -SelectorSet @{Address='*';Transport='HTTPS'} } catch {}; New-WSManInstance winrm/config/Listener -SelectorSet @{Address='*';Transport='HTTPS'} -ValueSet @{Hostname=$env:COMPUTERNAME;CertificateThumbprint=$cert.Thumbprint}; New-NetFirewallRule -DisplayName 'Allow WinRM HTTPS' -Direction Inbound -Protocol TCP -LocalPort 5986 -Action Allow -Profile Any; Restart-Service WinRM"</CommandLine>
                   </SynchronousCommand>
                 </FirstLogonCommands>
               </component>
