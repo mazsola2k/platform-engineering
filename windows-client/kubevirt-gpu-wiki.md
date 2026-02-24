@@ -277,7 +277,7 @@ Every QEMU flag has a KubeVirt CRD equivalent — except one. The translation wa
 | `-cpu host` | `cpu.model: host-passthrough` | Exposes all host CPU features — required for NVIDIA driver compatibility checks |
 | `+topoext,+invtsc` | `cpu.features[]: [topoext, invtsc]` | NUMA topology visibility + invariant TSC for stable guest timekeeping |
 | `kvm=off` | `features.kvm.hidden: true` | Strips KVM hypervisor signature from CPUID — prevents NVIDIA Code 43 |
-| `hv_vendor_id=...` | `features.hyperv.vendorid: ...` | Spoofs the hypervisor vendor string — second anti-detection layer |
+| `hv_vendor_id=...` | `features.hyperv.vendorid: ...` | Compatible Hyper-V vendor ID for correct environment reporting |
 | `hv_relaxed` | `features.hyperv.relaxed: {}` | Relaxed timer enforcement — reduces Windows BSOD risk under load |
 | `hv_spinlocks=0x1000` | `features.hyperv.spinlocks.retries: 8191` | Guest spinlock retry count before yielding to hypervisor |
 | `hv_vapic` | `features.hyperv.vapic: {}` | Virtual APIC acceleration — faster interrupt delivery |
@@ -300,7 +300,7 @@ If this is set incorrectly (or left at the default), the passthrough GPU receive
 
 The `romfile=` QEMU flag — which supplies the VGA BIOS ROM to the passthrough device — has **no equivalent CRD field**. KubeVirt's translation layer simply does not include it. This is the single parameter that required a workaround outside the standard CRD schema.
 
-The solution is the **hook sidecar** pattern described in [Defeating NVIDIA Code 43](#defeating-nvidia-code-43). In a raw QEMU prototype, the flag is trivial:
+The solution is the **hook sidecar** pattern described in [Resolving NVIDIA Code 43 in Passthrough](#resolving-nvidia-code-43-in-passthrough). In a raw QEMU prototype, the flag is trivial:
 
 ```bash
 -device vfio-pci,host=03:00.0,multifunction=on,romfile=/path/to/gpu.rom
@@ -342,7 +342,7 @@ The Windows 11 virtual machine is configured for maximum performance and driver 
 | **Network** | VirtIO NIC | Low-latency, high-throughput paravirtualised networking |
 | **GPU** | NVIDIA RTX 3090 via PCIe passthrough | Full device — unshared, unpartitioned |
 | **CPU Features** | Hyper-V enlightenments | `relaxed`, `spinlocks`, `vapic`, `synic`, `frequencies` |
-| **Anti-Detection** | `kvm.hidden` + vendor ID spoof + ROM | Prevents NVIDIA Code 43 |
+| **Environment Config** | `kvm.hidden` + Hyper-V vendor ID + ROM | Correct CPUID and firmware for passthrough topology |
 | **Automation** | WinRM via `kubectl port-forward` | Fully unattended driver install and verification |
 
 Inside Windows, the GPU appears as a **native device** in Device Manager. There is no observable difference from a bare-metal installation. NVIDIA driver deployment is fully automated — the Ansible playbook establishes a WinRM tunnel through `kubectl port-forward`, downloads the driver, executes a silent install, and validates via `nvidia-smi`. Zero manual interaction.
