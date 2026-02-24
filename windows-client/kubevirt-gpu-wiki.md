@@ -261,7 +261,70 @@ flowchart TD
 
 The operator reads a `VirtualMachine` CRD, converts it to libvirt XML, and delegates to `libvirtd`, which spawns `qemu-system-x86_64`. Every QEMU passthrough technique — VFIO device assignment, ROM injection, CPUID masking — functions identically whether invoked via KubeVirt YAML or a raw command line.
 
-> This implementation was prototyped as bare QEMU first, validating every flag, before translation to KubeVirt manifests. The runtime behaviour is identical.
+> This implementation was prototyped as a raw QEMU command line first ([`windows11-kvm-test.yaml`](windows-client/windows11-kvm-test.yaml)), validating every flag, before translation to KubeVirt manifests. The runtime behaviour is identical.
+
+### QEMU → KubeVirt Parameter Translation
+
+Every QEMU flag has a KubeVirt CRD equivalent — except one. The translation was mapped by building a working raw QEMU command first, then expressing each flag as structured YAML. The critical parameters, and the ones most likely to cause silent failures if omitted:
+
+| QEMU / libvirt flag | KubeVirt CRD field | Why it matters |
+|:--|:--|:--|
+| `-machine q35,accel=kvm` | `domain.machine.type: q35` | Q35 chipset with PCIe topology; KVM acceleration is implicit |
+| **`kernel-irqchip=on`** | **`features.ioapic.driver: kvm`** | **Routes hardware interrupts through the in-kernel IOAPIC. Without this, PCIe passthrough devices receive no IRQs and the GPU appears dead to the guest** |
+| `-cpu host` | `cpu.model: host-passthrough` | Exposes all host CPU features — required for NVIDIA driver compatibility checks |
+| `+topoext,+invtsc` | `cpu.features[]: [topoext, invtsc]` | NUMA topology visibility + invariant TSC for stable guest timekeeping |
+| `kvm=off` | `features.kvm.hidden: true` | Strips KVM hypervisor signature from CPUID — prevents NVIDIA Code 43 |
+| `hv_vendor_id=...` | `features.hyperv.vendorid: ...` | Spoofs the hypervisor vendor string — second anti-detection layer |
+| `hv_relaxed` | `features.hyperv.relaxed: {}` | Relaxed timer enforcement — reduces Windows BSOD risk under load |
+| `hv_spinlocks=0x1000` | `features.hyperv.spinlocks.retries: 8191` | Guest spinlock retry count before yielding to hypervisor |
+| `hv_vapic` | `features.hyperv.vapic: {}` | Virtual APIC acceleration — faster interrupt delivery |
+| `hv_time,hv_runtime,hv_synic,hv_reset,hv_vpindex,hv_tlbflush,hv_ipi` | `features.hyperv.{freqs,runtime,synic,reset,vpindex,tlbflush,ipi}: {}` | Hyper-V enlightenments — Windows detects these and enables optimised kernel code paths |
+| `-drive if=pflash,...OVMF_CODE.fd` | `firmware.bootloader.efi.secureBoot: false` | UEFI via OVMF; KubeVirt manages NVRAM persistence automatically |
+| `-device virtio-blk-pci,...` | `devices.disks[].disk.bus: virtio` | Paravirtualised block I/O — requires VirtIO drivers in guest |
+| `-device virtio-net-pci,...` | `devices.interfaces[].model: virtio` | Paravirtualised NIC — requires VirtIO drivers in guest |
+| `-device usb-tablet` | `devices.inputs[].type: tablet, bus: usb` | Absolute pointer — prevents mouse capture in VNC/console |
+| `-device vfio-pci,host=03:00.0` | `devices.gpus[].deviceName: nvidia.com/RTX_3090` | GPU passthrough; KubeVirt resolves PCI address via the device plugin |
+| `-device vfio-pci,host=03:00.1` | second entry in `devices.gpus[]` | GPU HDMI audio — same IOMMU group, must be passed together |
+| **`romfile=/path/to/gpu.rom`** | **No CRD field — solved via hook sidecar** | **The one parameter KubeVirt cannot express natively** |
+
+### The IRQ Routing Problem
+
+The `kernel-irqchip=on` → `features.ioapic.driver: kvm` mapping deserves special attention. In a standard VM without passthrough devices, the default virtual IOAPIC works fine. But when a physical PCIe device is passed through via VFIO, its **MSI/MSI-X interrupts must be routed through the kernel's IRQ chip**, not the userspace-emulated one.
+
+If this is set incorrectly (or left at the default), the passthrough GPU receives no interrupts. The device appears enumerated in Device Manager but the driver initialisation hangs or fails silently — a failure mode that looks identical to a Code 43 but has an entirely different root cause. The QEMU flag `kernel-irqchip=on` and the KubeVirt field `features.ioapic.driver: kvm` are the same instruction expressed in two notations: **route all I/O APIC interrupts through KVM's in-kernel implementation**.
+
+### ROM Injection: The One Parameter KubeVirt Cannot Express
+
+The `romfile=` QEMU flag — which supplies the VGA BIOS ROM to the passthrough device — has **no equivalent CRD field**. KubeVirt's translation layer simply does not include it. This is the single parameter that required a workaround outside the standard CRD schema.
+
+The solution is the **hook sidecar** pattern described in [Defeating NVIDIA Code 43](#defeating-nvidia-code-43). In a raw QEMU prototype, the flag is trivial:
+
+```bash
+-device vfio-pci,host=03:00.0,multifunction=on,romfile=/path/to/gpu.rom
+```
+
+In KubeVirt, the sidecar intercepts the libvirt XML via a gRPC `OnDefineDomain` hook, injects `<rom file='/dev/shm/gpu-03-00-0-legacyrom.rom'/>` into the GPU's `<hostdev>` element, and returns the modified XML. QEMU then sees the `romfile=` parameter transparently — as if it had been there from the start.
+
+```
+  VM Pod
+  ┌─────────────────────────────────────────────────────────┐
+  │  ┌──────────────────────────┐     /dev/shm/             │
+  │  │  gpu-romfile-hook        │──→  gpu-03-00-0-          │
+  │  │  (sidecar container)     │     legacyrom.rom         │
+  │  │                          │          │                │
+  │  │  OnDefineDomain gRPC:    │          │                │
+  │  │  inject <rom file=.../>  │          │                │
+  │  └──────────────────────────┘          │                │
+  │                                        ↓                │
+  │  ┌──────────────────────────────────────────────────┐   │
+  │  │  virt-launcher → libvirt → qemu-system-x86_64    │   │
+  │  │  -device vfio-pci,host=03:00.0,romfile=          │   │
+  │  │              /dev/shm/gpu-03-00-0-legacyrom.rom   │   │
+  │  └──────────────────────────────────────────────────┘   │
+  └─────────────────────────────────────────────────────────┘
+```
+
+All containers in a pod share the same IPC namespace — `/dev/shm` written by the sidecar is visible to `virt-launcher` and QEMU. The ROM is baked into the sidecar image at build time. No host-path mounts, no runtime dependencies.
 
 ---
 
