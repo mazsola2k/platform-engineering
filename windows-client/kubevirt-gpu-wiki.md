@@ -2,7 +2,7 @@
 
 # Dynamic GPU Passthrough with KubeVirt
 
-### Deterministic, Zero-Downtime GPU Multiplexing at the Hardware Layer
+### Deterministic, Zero-Downtime GPU switching at Hardware Layer
 
 [![Kubernetes](https://img.shields.io/badge/Kubernetes-326CE5?style=for-the-badge&logo=kubernetes&logoColor=white)](https://kubernetes.io)
 [![KubeVirt](https://img.shields.io/badge/KubeVirt-009639?style=for-the-badge&logo=kubernetes&logoColor=white)](https://kubevirt.io)
