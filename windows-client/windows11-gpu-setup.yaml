@@ -335,10 +335,26 @@
           #!/bin/bash
           # Bind ONLY {{ gpu_pci_slot }} + {{ gpu_audio_slot }} to vfio-pci.
           # GPU at 0a:00.0 is left for the Fedora host desktop / AI workloads.
-          for DEV in {{ gpu_pci_slot }} {{ gpu_audio_slot }}; do
+
+          DEVICES="{{ gpu_pci_slot }} {{ gpu_audio_slot }}"
+
+          # Step 1: Set driver_override to block nvidia/nouveau from claiming these
+          for DEV in $DEVICES; do
               echo "vfio-pci" > /sys/bus/pci/devices/${DEV}/driver_override
           done
+
+          # Step 2: Ensure vfio-pci module is loaded
           modprobe -i vfio-pci
+
+          # Step 3: Explicitly bind devices to vfio-pci
+          # (driver_override alone does NOT trigger a bind — without this step
+          #  the GPU can end up with no driver at all after boot)
+          for DEV in $DEVICES; do
+              if [ -e /sys/bus/pci/devices/${DEV}/driver ]; then
+                  echo "${DEV}" > /sys/bus/pci/devices/${DEV}/driver/unbind 2>/dev/null
+              fi
+              echo "${DEV}" > /sys/bus/pci/drivers/vfio-pci/bind 2>/dev/null
+          done
       when: change_vfio_dracut_hook
 
     - name: Create dracut.conf.d to include vfio modules and hook in initramfs
