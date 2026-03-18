@@ -1,0 +1,113 @@
+---
+# Oracle RAC Pre-flight Checks
+# Validates host resources, images, KubeVirt readiness, and variable sanity.
+
+- name: Check KubeVirt is operational
+  kubernetes.core.k8s_info:
+    api_version: kubevirt.io/v1
+    kind: KubeVirt
+  register: kubevirt_check
+  failed_when: false
+
+- name: Fail if KubeVirt is not installed
+  ansible.builtin.fail:
+    msg: "KubeVirt is not installed or not reachable. Cannot provision RAC VMs."
+  when: kubevirt_check.resources | default([]) | length == 0
+
+- name: Read current KubeVirt feature gates
+  kubernetes.core.k8s_info:
+    api_version: kubevirt.io/v1
+    kind: KubeVirt
+    name: kubevirt
+    namespace: kubevirt
+  register: kubevirt_config
+
+- name: Add HostDisk feature gate if missing
+  kubernetes.core.k8s_json_patch:
+    api_version: kubevirt.io/v1
+    kind: KubeVirt
+    name: kubevirt
+    namespace: kubevirt
+    patch:
+      - op: add
+        path: /spec/configuration/developerConfiguration/featureGates/-
+        value: HostDisk
+  when: "'HostDisk' not in (kubevirt_config.resources[0].spec.configuration.developerConfiguration.featureGates | default([]))"
+
+- name: Check qcow2 image exists
+  ansible.builtin.stat:
+    path: "{{ qcow2_image_path }}"
+  register: qcow2_check
+
+- name: Fail if qcow2 image is missing
+  ansible.builtin.fail:
+    msg: >-
+      RHEL 9.6 qcow2 image not found at {{ qcow2_image_path }}.
+      Download from https://access.redhat.com/downloads/content/479/ver=/rhel---9/9.6/x86_64/product-software
+  when: not qcow2_check.stat.exists
+
+- name: Ensure storage directory exists
+  ansible.builtin.file:
+    path: "{{ storage_dir }}"
+    state: directory
+    mode: "0755"
+  become: true
+
+- name: Check available disk space on storage_dir
+  ansible.builtin.shell: df -BG {{ storage_dir }} | awk 'NR==2 {gsub(/G/,"",$4); print $4}'
+  register: storage_free_gb
+  changed_when: false
+  failed_when: false
+
+- name: Calculate required disk space
+  ansible.builtin.set_fact:
+    # Each VM system disk + ASM shared disks
+    rac_required_gb: >-
+      {{ ((rac_nodes | int) * (rac_node_disk | regex_replace('Gi$','') | int))
+       + ((rac_dataguard | bool) | ternary((rac_standby_disk | regex_replace('Gi$','') | int), 0))
+       + ((rac_fsfo | bool) | ternary((rac_observer_disk | regex_replace('Gi$','') | int), 0))
+       + (rac_asm_data_size | regex_replace('G$','') | int)
+       + (rac_asm_fra_size | regex_replace('G$','') | int)
+       + (rac_asm_vote_size | regex_replace('G$','') | int) }}
+
+- name: Display resource check
+  ansible.builtin.debug:
+    msg:
+      - "Pre-flight Resource Check:"
+      - "  Storage available: {{ storage_free_gb.stdout | default('unknown') }}G at {{ storage_dir }}"
+      - "  Storage required:  ~{{ rac_required_gb }}G"
+      - "  qcow2 image:       {{ qcow2_image_path }} (present)"
+      - "  KubeVirt:           operational"
+
+- name: Warn if disk space may be insufficient
+  ansible.builtin.debug:
+    msg: "⚠️  Available disk space ({{ storage_free_gb.stdout }}G) may be insufficient for estimated need (~{{ rac_required_gb }}G)"
+  when: storage_free_gb.stdout | default('0') | int < rac_required_gb | int
+
+- name: Check available host memory
+  ansible.builtin.shell: free -g | awk 'NR==2{print $7}'
+  register: host_free_mem_gb
+  changed_when: false
+  failed_when: false
+
+- name: Calculate required memory
+  ansible.builtin.set_fact:
+    rac_required_mem_gb: >-
+      {{ ((rac_nodes | int) * (rac_node_memory | regex_replace('Gi$','') | int))
+       + ((rac_dataguard | bool) | ternary((rac_standby_memory | regex_replace('Gi$','') | int), 0))
+       + ((rac_fsfo | bool) | ternary((rac_observer_memory | regex_replace('Gi$','') | int), 0)) }}
+
+- name: Display memory check
+  ansible.builtin.debug:
+    msg:
+      - "  Host free memory:  {{ host_free_mem_gb.stdout | default('unknown') }}G"
+      - "  Memory required:   ~{{ rac_required_mem_gb }}G"
+
+- name: Warn if memory may be insufficient
+  ansible.builtin.debug:
+    msg: "⚠️  Available host memory ({{ host_free_mem_gb.stdout }}G) may be insufficient for estimated need (~{{ rac_required_mem_gb }}G)"
+  when: host_free_mem_gb.stdout | default('0') | int < rac_required_mem_gb | int
+
+- name: Pre-flight checks passed
+  ansible.builtin.debug:
+    msg: "✅ Pre-flight checks complete. Proceeding with Oracle RAC deployment."

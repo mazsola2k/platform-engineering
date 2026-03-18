@@ -1,0 +1,198 @@
+---
+# Oracle RAC Cluster Controller
+# Provisions a configurable Oracle RAC topology on KubeVirt VMs.
+#
+# Topologies (set via rac_nodes / rac_dataguard / rac_fsfo):
+#   A — RAC only:           rac_nodes=2  rac_dataguard=false  rac_fsfo=false   → 2 VMs
+#   B — RAC + Data Guard:   rac_nodes=2  rac_dataguard=true   rac_fsfo=false   → 3 VMs
+#   C — RAC + DG + FSFO:    rac_nodes=2  rac_dataguard=true   rac_fsfo=true    → 4 VMs
+#   D — DG only (no RAC):   rac_nodes=0  rac_dataguard=true   rac_fsfo=false   → 2 VMs
+#   E — DG + FSFO (no RAC): rac_nodes=0  rac_dataguard=true   rac_fsfo=true    → 3 VMs
+#   F — Single node:        rac_nodes=0  rac_dataguard=false   rac_fsfo=false   → use oracle-controller.yaml
+#
+# Usage examples:
+#   Install (full):    ansible-playbook oracle-rac-controller.yaml -e rac_action=install
+#   Install (RAC only): ansible-playbook oracle-rac-controller.yaml -e rac_action=install -e rac_dataguard=false
+#   Uninstall:         ansible-playbook oracle-rac-controller.yaml -e rac_action=uninstall
+#   Status:            ansible-playbook oracle-rac-controller.yaml -e rac_action=status
+
+- name: Oracle RAC Cluster Controller
+  hosts: localhost
+  gather_facts: false
+  vars:
+    # --- Topology control ---
+    # All vars use plain defaults; override with -e (extra vars have highest precedence)
+    rac_action: "status"
+    rac_nodes: 2
+    rac_dataguard: true
+    rac_fsfo: true
+    kubevirt_namespace: "default"
+
+    # --- VM sizing ---
+    rac_node_cpu: 4
+    rac_node_memory: "8Gi"
+    rac_node_disk: "40Gi"
+    rac_standby_cpu: 4
+    rac_standby_memory: "8Gi"
+    rac_standby_disk: "40Gi"
+    rac_observer_cpu: 1
+    rac_observer_memory: "1Gi"
+    rac_observer_disk: "10Gi"
+
+    # --- ASM shared disks ---
+    rac_asm_data_size: "20G"
+    rac_asm_fra_size: "10G"
+    rac_asm_vote_size: "2G"
+    rac_shared_disk_path: "/var/lib/kubevirt/rac-shared"
+
+    # --- Network (L2 VXLAN bridge) ---
+    rac_interconnect_subnet: "192.168.10.0/24"
+    rac_interconnect_bridge: "br-vm"
+    rac_vxlan_id: 100
+    rac_vxlan_port: 4789
+
+    # --- Oracle ---
+    rac_db_name: "RACDB"
+    rac_pdb_name: "RACPDB1"
+    rac_scan_name: "rac-scan"
+    rac_cluster_name: "rac-cluster"
+    rac_oracle_password: "Oracle123"
+    rac_vault_secret: "secret/data/oracle-rac/admin"
+
+    # --- Base OS image ---
+    qcow2_image_path: "./rhel-9.6-x86_64-kvm.qcow2"
+    storage_dir: "/data/vms"
+
+    # --- Red Hat subscription (passed through to cloud-init) ---
+    subscription_username: "{{ lookup('env', 'subscription_username') | default('XXXXX', true) }}"
+    subscription_password: "{{ lookup('env', 'subscription_password') | default('XXXXX', true) }}"
+
+    # --- Derived: node name lists ---
+    rac_node_names: >-
+      {{ (rac_nodes | int > 0) | ternary(
+           ['rac-node1', 'rac-node2'][:rac_nodes | int],
+           ['rac-primary']
+         ) }}
+    rac_standby_name: "rac-standby"
+    rac_observer_name: "rac-observer"
+
+    # --- Interconnect IPs (static assignment within the private subnet) ---
+    rac_node1_priv_ip: "192.168.10.11"
+    rac_node2_priv_ip: "192.168.10.12"
+    rac_standby_priv_ip: "192.168.10.13"
+    rac_observer_priv_ip: "192.168.10.14"
+    rac_bridge_ip: "192.168.10.1"
+    rac_scan_ip: "192.168.10.100"
+
+  tasks:
+    - name: Display resolved topology
+      ansible.builtin.debug:
+        msg:
+          - "Oracle RAC Controller"
+          - "  Action:      {{ rac_action }}"
+          - "  RAC nodes:   {{ rac_nodes }}"
+          - "  Data Guard:  {{ rac_dataguard }}"
+          - "  FSFO:        {{ rac_fsfo }}"
+          - "  Namespace:   {{ kubevirt_namespace }}"
+          - "  Node names:  {{ rac_node_names }}"
+
+    - name: Validate action parameter
+      ansible.builtin.fail:
+        msg: "Invalid rac_action '{{ rac_action }}'. Must be one of: install, uninstall, status"
+      when: rac_action not in ['install', 'uninstall', 'status']
+
+    - name: Validate topology combination
+      ansible.builtin.fail:
+        msg: "rac_fsfo=true requires rac_dataguard=true"
+      when: (rac_fsfo | bool) and not (rac_dataguard | bool)
+
+    - name: Validate node count
+      ansible.builtin.fail:
+        msg: "rac_nodes must be 0 (single/DG) or 2 (RAC). Got {{ rac_nodes }}"
+      when: rac_nodes | int not in [0, 2]
+
+    - name: Redirect to existing single-node controller
+      ansible.builtin.debug:
+        msg: "Topology F (single node, no RAC, no DG) — use oracle-controller.yaml instead."
+      when: rac_nodes | int == 0 and not (rac_dataguard | bool)
+
+    - name: Abort for Topology F
+      ansible.builtin.meta: end_play
+      when: rac_nodes | int == 0 and not (rac_dataguard | bool)
+
+    # ==================== INSTALL ====================
+    - name: Install — Preflight checks
+      ansible.builtin.include_tasks: oracle-rac/rac-preflight.yaml
+      when: rac_action == 'install'
+
+    - name: Install — L2 VXLAN network for RAC interconnect
+      ansible.builtin.include_tasks: oracle-rac/rac-network-install.yaml
+      when: rac_action == 'install'
+
+    - name: Install — Create shared ASM disks
+      ansible.builtin.include_tasks: oracle-rac/rac-shared-disks.yaml
+      when: rac_action == 'install' and rac_nodes | int > 0
+
+    - name: Install — Provision RAC node VMs
+      ansible.builtin.include_tasks: oracle-rac/rac-nodes-install.yaml
+      when: rac_action == 'install' and rac_nodes | int > 0
+
+    - name: Install — Provision primary VM (non-RAC DG topology)
+      ansible.builtin.include_tasks: oracle-rac/rac-nodes-install.yaml
+      when: rac_action == 'install' and rac_nodes | int == 0 and (rac_dataguard | bool)
+
+    - name: Install — Grid Infrastructure + ASM
+      ansible.builtin.include_tasks: oracle-rac/rac-grid-install.yaml
+      when: rac_action == 'install' and rac_nodes | int > 0
+
+    - name: Install — Create RAC database
+      ansible.builtin.include_tasks: oracle-rac/rac-db-install.yaml
+      when: rac_action == 'install'
+
+    - name: Install — Provision standby + RMAN duplicate
+      ansible.builtin.include_tasks: oracle-rac/rac-standby-install.yaml
+      when: rac_action == 'install' and (rac_dataguard | bool)
+
+    - name: Install — Configure Data Guard Broker
+      ansible.builtin.include_tasks: oracle-rac/rac-dg-broker-install.yaml
+      when: rac_action == 'install' and (rac_dataguard | bool)
+
+    - name: Install — Provision FSFO Observer
+      ansible.builtin.include_tasks: oracle-rac/rac-observer-install.yaml
+      when: rac_action == 'install' and (rac_fsfo | bool)
+
+    - name: Install — Complete
+      ansible.builtin.debug:
+        msg: "✅ Oracle RAC cluster installation complete (nodes={{ rac_nodes }}, dg={{ rac_dataguard }}, fsfo={{ rac_fsfo }})"
+      when: rac_action == 'install'
+
+    # ==================== STATUS ====================
+    - name: Status — Check cluster status
+      ansible.builtin.include_tasks: oracle-rac/rac-status.yaml
+      when: rac_action == 'status'
+
+    # ==================== UNINSTALL ====================
+    - name: Uninstall — Remove FSFO Observer
+      ansible.builtin.include_tasks: oracle-rac/rac-observer-uninstall.yaml
+      when: rac_action == 'uninstall' and (rac_fsfo | bool)
+
+    - name: Uninstall — Remove standby
+      ansible.builtin.include_tasks: oracle-rac/rac-standby-uninstall.yaml
+      when: rac_action == 'uninstall' and (rac_dataguard | bool)
+
+    - name: Uninstall — Remove RAC node VMs
+      ansible.builtin.include_tasks: oracle-rac/rac-nodes-uninstall.yaml
+      when: rac_action == 'uninstall'
+
+    - name: Uninstall — Remove shared ASM disks
+      ansible.builtin.include_tasks: oracle-rac/rac-shared-disks-uninstall.yaml
+      when: rac_action == 'uninstall' and rac_nodes | int > 0
+
+    - name: Uninstall — Remove L2 VXLAN network
+      ansible.builtin.include_tasks: oracle-rac/rac-network-uninstall.yaml
+      when: rac_action == 'uninstall'
+
+    - name: Uninstall — Complete
+      ansible.builtin.debug:
+        msg: "✅ Oracle RAC cluster uninstall complete"
+      when: rac_action == 'uninstall'

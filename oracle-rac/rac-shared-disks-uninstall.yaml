@@ -1,0 +1,22 @@
+---
+# Remove shared ASM disk images from host.
+
+- name: Remove ASM shared disk images
+  ansible.builtin.file:
+    path: "{{ rac_shared_disk_path }}/{{ item }}"
+    state: absent
+  loop:
+    - asm-data.img
+    - asm-fra.img
+    - asm-vote.img
+  failed_when: false
+
+- name: Remove shared disk directory (if empty)
+  ansible.builtin.file:
+    path: "{{ rac_shared_disk_path }}"
+    state: absent
+  failed_when: false
+
+- name: Display ASM disk cleanup status
+  ansible.builtin.debug:
+    msg: "✅ ASM shared disk images removed from {{ rac_shared_disk_path }}"

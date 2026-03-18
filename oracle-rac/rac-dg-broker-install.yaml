@@ -1,0 +1,136 @@
+---
+# Configure Oracle Data Guard Broker for automated failover management.
+# Creates a broker configuration linking the primary and standby databases.
+# Optionally enables Fast-Start Failover (FSFO) if rac_fsfo is true.
+
+# ---- Get primary IP ----
+- name: Get primary VMI IP
+  kubernetes.core.k8s_info:
+    api_version: kubevirt.io/v1
+    kind: VirtualMachineInstance
+    name: "{{ rac_node_names[0] }}"
+    namespace: "{{ kubevirt_namespace }}"
+  register: dg_primary_vmi
+
+- name: Set primary IP for DG broker
+  ansible.builtin.set_fact:
+    dg_primary_ip: "{{ dg_primary_vmi.resources[0].status.interfaces[0].ipAddress }}"
+
+- name: Add primary to inventory for DG broker
+  ansible.builtin.add_host:
+    name: "{{ rac_node_names[0] }}"
+    ansible_host: "{{ dg_primary_ip }}"
+    ansible_user: "oracle"
+    ansible_password: "{{ rac_oracle_password }}"
+    ansible_become: true
+    ansible_become_method: sudo
+    ansible_ssh_common_args: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+
+# ---- Enable DG Broker on primary ----
+- name: Enable Data Guard Broker on primary
+  delegate_to: "{{ rac_node_names[0] }}"
+  become: true
+  become_user: oracle
+  ansible.builtin.shell: |
+    export ORACLE_HOME={{ _oracle_env.ORACLE_HOME | default('/u01/app/oracle/product/26ai/dbhome_1') }}
+    export ORACLE_SID={{ rac_db_name }}1
+    export PATH=$ORACLE_HOME/bin:$PATH
+
+    sqlplus -s / as sysdba <<EOF
+    ALTER SYSTEM SET DG_BROKER_START=TRUE SCOPE=BOTH;
+    ALTER SYSTEM SET LOG_ARCHIVE_DEST_STATE_2=ENABLE SCOPE=BOTH;
+    EXIT;
+    EOF
+  register: dg_broker_enable_primary
+
+# ---- Enable DG Broker on standby ----
+- name: Get standby VMI IP
+  kubernetes.core.k8s_info:
+    api_version: kubevirt.io/v1
+    kind: VirtualMachineInstance
+    name: "{{ rac_standby_name }}"
+    namespace: "{{ kubevirt_namespace }}"
+  register: dg_standby_vmi
+
+- name: Set standby IP for DG broker
+  ansible.builtin.set_fact:
+    dg_standby_ip: "{{ dg_standby_vmi.resources[0].status.interfaces[0].ipAddress }}"
+
+- name: Add standby to inventory for DG broker
+  ansible.builtin.add_host:
+    name: "{{ rac_standby_name }}"
+    ansible_host: "{{ dg_standby_ip }}"
+    ansible_user: "oracle"
+    ansible_password: "{{ rac_oracle_password }}"
+    ansible_become: true
+    ansible_become_method: sudo
+    ansible_ssh_common_args: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+
+- name: Enable Data Guard Broker on standby
+  delegate_to: "{{ rac_standby_name }}"
+  become: true
+  become_user: oracle
+  ansible.builtin.shell: |
+    export ORACLE_HOME={{ _oracle_env.ORACLE_HOME | default('/u01/app/oracle/product/26ai/dbhome_1') }}
+    export ORACLE_SID={{ rac_db_name }}
+    export PATH=$ORACLE_HOME/bin:$PATH
+
+    sqlplus -s / as sysdba <<EOF
+    ALTER SYSTEM SET DG_BROKER_START=TRUE SCOPE=BOTH;
+    EXIT;
+    EOF
+  register: dg_broker_enable_standby
+
+# ---- Create broker configuration via DGMGRL ----
+- name: Create Data Guard Broker configuration
+  delegate_to: "{{ rac_node_names[0] }}"
+  become: true
+  become_user: oracle
+  ansible.builtin.shell: |
+    export ORACLE_HOME={{ _oracle_env.ORACLE_HOME | default('/u01/app/oracle/product/26ai/dbhome_1') }}
+    export PATH=$ORACLE_HOME/bin:$PATH
+
+    dgmgrl sys/{{ rac_oracle_password }}@{{ rac_db_name }}_PRIMARY <<EOF
+    CREATE CONFIGURATION '{{ rac_cluster_name }}_dg'
+      AS PRIMARY DATABASE IS '{{ rac_db_name }}'
+      CONNECT IDENTIFIER IS '{{ rac_db_name }}_PRIMARY';
+
+    ADD DATABASE '{{ rac_db_name }}_STDBY'
+      AS CONNECT IDENTIFIER IS '{{ rac_db_name }}_STDBY'
+      MAINTAINED AS PHYSICAL;
+
+    ENABLE CONFIGURATION;
+    SHOW CONFIGURATION;
+    EXIT;
+    EOF
+  register: dgmgrl_config_result
+
+- name: Display DG Broker configuration result
+  ansible.builtin.debug:
+    msg:
+      - "✅ Data Guard Broker configured"
+      - "{{ dgmgrl_config_result.stdout_lines | default(['Configuration output not available']) }}"
+
+# ---- Enable Fast-Start Failover (if rac_fsfo is true) ----
+- name: Enable Fast-Start Failover
+  delegate_to: "{{ rac_node_names[0] }}"
+  become: true
+  become_user: oracle
+  ansible.builtin.shell: |
+    export ORACLE_HOME={{ _oracle_env.ORACLE_HOME | default('/u01/app/oracle/product/26ai/dbhome_1') }}
+    export PATH=$ORACLE_HOME/bin:$PATH
+
+    dgmgrl sys/{{ rac_oracle_password }}@{{ rac_db_name }}_PRIMARY <<EOF
+    ENABLE FAST_START FAILOVER;
+    SHOW FAST_START FAILOVER;
+    EXIT;
+    EOF
+  register: fsfo_enable_result
+  when: rac_fsfo | bool
+
+- name: Display FSFO status
+  ansible.builtin.debug:
+    msg:
+      - "✅ Fast-Start Failover enabled"
+      - "{{ fsfo_enable_result.stdout_lines | default(['FSFO output not available']) }}"
+  when: rac_fsfo | bool

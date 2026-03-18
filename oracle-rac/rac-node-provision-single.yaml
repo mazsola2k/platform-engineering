@@ -1,0 +1,335 @@
+---
+# Provision a single RAC node VM.
+# Called in a loop from rac-nodes-install.yaml with current_node_name and node_idx.
+
+- name: "{{ current_node_name }} — Set node-specific variables"
+  ansible.builtin.set_fact:
+    _vm_name: "{{ current_node_name }}"
+    _vm_cpu: "{{ rac_node_cpu }}"
+    _vm_memory: "{{ rac_node_memory }}"
+    _vm_disk: "{{ rac_node_disk }}"
+    _is_rac_node: "{{ rac_nodes | int > 0 }}"
+    _priv_ip: "{{ (node_idx == 0) | ternary(rac_node1_priv_ip, rac_node2_priv_ip) }}"
+    _vip_suffix: "{{ (node_idx == 0) | ternary('21', '22') }}"
+
+# ---- PV ----
+- name: "{{ current_node_name }} — Check for existing PV"
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: PersistentVolume
+    name: "{{ _vm_name }}-system-pv"
+  register: node_pv_check
+  failed_when: false
+
+- name: "{{ current_node_name }} — Create PersistentVolume"
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: PersistentVolume
+      metadata:
+        name: "{{ _vm_name }}-system-pv"
+        labels:
+          type: local
+          app: "{{ _vm_name }}"
+      spec:
+        capacity:
+          storage: "{{ _vm_disk }}"
+        accessModes: ["ReadWriteOnce"]
+        persistentVolumeReclaimPolicy: Retain
+        storageClassName: local-storage
+        volumeMode: Filesystem
+        hostPath:
+          path: "{{ storage_abs_dir }}/{{ _vm_name }}-system-disk"
+          type: DirectoryOrCreate
+        nodeAffinity:
+          required:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: In
+                    values: ["{{ node_hostname.stdout }}"]
+  when: node_pv_check.resources | length == 0
+
+# ---- PVC ----
+- name: "{{ current_node_name }} — Check for existing PVC"
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: PersistentVolumeClaim
+    name: "{{ _vm_name }}-system-disk"
+    namespace: "{{ kubevirt_namespace }}"
+  register: node_pvc_check
+  failed_when: false
+
+- name: "{{ current_node_name }} — Create PersistentVolumeClaim"
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata:
+        name: "{{ _vm_name }}-system-disk"
+        namespace: "{{ kubevirt_namespace }}"
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: "{{ _vm_disk }}"
+        storageClassName: local-storage
+        volumeMode: Filesystem
+        volumeName: "{{ _vm_name }}-system-pv"
+  when: node_pvc_check.resources | length == 0
+
+# ---- Ensure hostPath directory exists ----
+- name: "{{ current_node_name }} — Ensure PV directory exists"
+  ansible.builtin.file:
+    path: "{{ storage_abs_dir }}/{{ _vm_name }}-system-disk"
+    state: directory
+    mode: '0777'
+  become: true
+
+# ---- qcow2 → raw conversion ----
+- name: "{{ current_node_name }} — Check if disk.img already exists"
+  ansible.builtin.stat:
+    path: "{{ storage_abs_dir }}/{{ _vm_name }}-system-disk/disk.img"
+  register: disk_img_check
+
+- name: "{{ current_node_name }} — Convert qcow2 to raw"
+  ansible.builtin.command:
+    cmd: "qemu-img convert -f qcow2 -O raw '{{ qcow2_image_path }}' '{{ storage_abs_dir }}/{{ _vm_name }}-system-disk/disk.img'"
+  when: not disk_img_check.stat.exists
+  become: true
+
+- name: "{{ current_node_name }} — Resize raw disk image"
+  ansible.builtin.command:
+    cmd: "qemu-img resize '{{ storage_abs_dir }}/{{ _vm_name }}-system-disk/disk.img' {{ _vm_disk | regex_replace('Gi$', 'G') }}"
+  when: not disk_img_check.stat.exists
+  become: true
+
+- name: "{{ current_node_name }} — Set ownership on disk.img"
+  ansible.builtin.file:
+    path: "{{ storage_abs_dir }}/{{ _vm_name }}-system-disk/disk.img"
+    owner: qemu
+    group: qemu
+    mode: '0644'
+  become: true
+
+# ---- Build /etc/hosts content for all RAC nodes ----
+- name: "{{ current_node_name }} — Build /etc/hosts entries"
+  ansible.builtin.set_fact:
+    _hosts_content: |
+      # RAC L2 interconnect
+      {{ rac_node1_priv_ip }}  rac-node1 rac-node1-priv rac-primary
+      {{ rac_node2_priv_ip }}  rac-node2 rac-node2-priv
+      {{ rac_standby_priv_ip }}  rac-standby
+      {{ rac_scan_ip }}        {{ rac_scan_name }}
+      # RAC VIPs
+      192.168.10.{{ _vip_suffix }}  {{ _vm_name }}-vip
+
+# ---- Create cloud-init Secret (userdata exceeds KubeVirt 2048B inline limit) ----
+- name: "{{ current_node_name }} — Create cloud-init Secret"
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: "{{ _vm_name }}-cloudinit"
+        namespace: "{{ kubevirt_namespace }}"
+      type: Opaque
+      stringData:
+        userdata: |
+          #cloud-config
+          hostname: {{ _vm_name }}
+          disable_root: false
+          ssh_pwauth: true
+          users:
+            - name: oracle
+              sudo: ALL=(ALL) NOPASSWD:ALL
+              lock_passwd: false
+            - name: grid
+              sudo: ALL=(ALL) NOPASSWD:ALL
+              lock_passwd: false
+          chpasswd:
+            list: |
+              root:{{ rac_oracle_password }}
+              oracle:{{ rac_oracle_password }}
+              grid:{{ rac_oracle_password }}
+            expire: False
+          write_files:
+            - path: /etc/ssh/sshd_config.d/99-cloud-init.conf
+              content: |
+                PermitRootLogin yes
+                PasswordAuthentication yes
+                ChallengeResponseAuthentication no
+                UsePAM yes
+            - path: /etc/hosts.rac
+              content: |
+                {{ _hosts_content | indent(8) }}
+            - path: /etc/sysctl.d/98-oracle-rac.conf
+              content: |
+                kernel.shmmax = 4398046511104
+                kernel.shmall = 1073741824
+                kernel.shmmni = 4096
+                kernel.sem = 250 32000 100 128
+                net.ipv4.ip_local_port_range = 9000 65500
+                net.core.rmem_default = 262144
+                net.core.rmem_max = 4194304
+                net.core.wmem_default = 262144
+                net.core.wmem_max = 1048576
+                fs.aio-max-nr = 1048576
+                fs.file-max = 6815744
+                vm.hugetlb_shm_group = 54321
+            - path: /etc/security/limits.d/98-oracle.conf
+              content: |
+                oracle soft nproc 2047
+                oracle hard nproc 16384
+                oracle soft nofile 1024
+                oracle hard nofile 65536
+                oracle soft stack 10240
+                oracle hard stack 32768
+                oracle soft memlock unlimited
+                oracle hard memlock unlimited
+                grid soft nproc 2047
+                grid hard nproc 16384
+                grid soft nofile 1024
+                grid hard nofile 65536
+                grid soft stack 10240
+                grid hard stack 32768
+                grid soft memlock unlimited
+                grid hard memlock unlimited
+          runcmd:
+            - growpart /dev/vda 1
+            - resize2fs /dev/vda1 || xfs_growfs /
+            - cat /etc/hosts.rac >> /etc/hosts
+            - sysctl --system
+            - systemctl reload sshd
+            - |
+              subscription-manager register \
+                --username="{{ subscription_username }}" \
+                --password="{{ subscription_password }}" \
+                --auto-attach 2>&1 || true
+            - subscription-manager repos --enable=rhel-9-for-x86_64-baseos-rpms --enable=rhel-9-for-x86_64-appstream-rpms 2>&1 || true
+            - dnf install -y oracle-database-preinstall-26ai bc binutils elfutils-libelf ksh libaio libaio-devel libXrender make sysstat unzip tar wget nfs-utils 2>&1 || true
+            - groupadd -g 54321 oinstall 2>/dev/null || true
+            - groupadd -g 54322 dba 2>/dev/null || true
+            - groupadd -g 54323 oper 2>/dev/null || true
+            - groupadd -g 54324 backupdba 2>/dev/null || true
+            - groupadd -g 54325 dgdba 2>/dev/null || true
+            - groupadd -g 54326 kmdba 2>/dev/null || true
+            - groupadd -g 54327 asmdba 2>/dev/null || true
+            - groupadd -g 54328 asmoper 2>/dev/null || true
+            - groupadd -g 54329 asmadmin 2>/dev/null || true
+            - usermod -g oinstall -G dba,oper,backupdba,dgdba,kmdba,asmdba oracle 2>/dev/null || true
+            - useradd -u 54331 -g oinstall -G dba,asmadmin,asmdba,asmoper grid 2>/dev/null || usermod -g oinstall -G dba,asmadmin,asmdba,asmoper grid
+            - mkdir -p /u01/app/grid /u01/app/26ai/grid /u01/app/oracle /u01/app/oraInventory
+            - chown -R grid:oinstall /u01/app/grid /u01/app/26ai/grid /u01/app/oraInventory
+            - chown -R oracle:oinstall /u01/app/oracle
+            - chmod -R 775 /u01
+            - echo "cloud-init RAC node setup complete" | tee /var/log/cloudinit-rac.log
+            - |
+              # Configure L2 interconnect on second NIC
+              for attempt in $(seq 1 60); do
+                DEFAULT_IF=$(ip route show default 2>/dev/null | awk '{print $5}' | head -1)
+                for iface in $(ls /sys/class/net/ | grep -v '^lo$' | sort); do
+                  [ "$iface" = "$DEFAULT_IF" ] && continue
+                  nmcli con add type ethernet ifname "$iface" con-name l2-interconnect ip4 {{ _priv_ip }}/24 2>/dev/null
+                  nmcli con up l2-interconnect 2>/dev/null
+                  echo "L2 interconnect configured on $iface with IP {{ _priv_ip }}" | tee -a /var/log/cloudinit-rac.log
+                  exit 0
+                done
+                sleep 1
+              done
+              echo "WARNING: Could not find second NIC for L2 interconnect" | tee -a /var/log/cloudinit-rac.log
+
+# ---- Build VM definition ----
+- name: "{{ current_node_name }} — Build VirtualMachine definition"
+  ansible.builtin.set_fact:
+    _vm_definition:
+      apiVersion: kubevirt.io/v1
+      kind: VirtualMachine
+      metadata:
+        name: "{{ _vm_name }}"
+        namespace: "{{ kubevirt_namespace }}"
+        labels:
+          app: oracle-rac
+          role: "{{ (_is_rac_node | bool) | ternary('rac-node', 'primary') }}"
+      spec:
+        running: true
+        template:
+          metadata:
+            labels:
+              kubevirt.io/domain: "{{ _vm_name }}"
+              app: oracle-rac
+          spec:
+            domain:
+              cpu:
+                cores: "{{ _vm_cpu | int }}"
+              devices:
+                disks:
+                  - name: rootdisk
+                    disk:
+                      bus: virtio
+                  - name: cloudinitdisk
+                    disk:
+                      bus: virtio
+                interfaces:
+                  - name: default
+                    masquerade: {}
+                  - name: l2net
+                    bridge: {}
+              resources:
+                requests:
+                  memory: "{{ _vm_memory }}"
+            networks:
+              - name: default
+                pod: {}
+              - name: l2net
+                multus:
+                  networkName: rac-interconnect
+            volumes:
+              - name: rootdisk
+                persistentVolumeClaim:
+                  claimName: "{{ _vm_name }}-system-disk"
+              - name: cloudinitdisk
+                cloudInitNoCloud:
+                  secretRef:
+                    name: "{{ _vm_name }}-cloudinit"
+
+# ---- Add ASM hostDisks for RAC nodes (shared storage) ----
+- name: "{{ current_node_name }} — Add ASM shared disks"
+  ansible.builtin.set_fact:
+    _vm_definition: >-
+      {{ _vm_definition | combine({
+        'spec': {
+          'template': {
+            'spec': {
+              'domain': {
+                'devices': {
+                  'disks': _vm_definition.spec.template.spec.domain.devices.disks + [
+                    {'name': 'asm-data', 'disk': {'bus': 'virtio'}, 'serial': 'ASM_DATA', 'shareable': true},
+                    {'name': 'asm-fra', 'disk': {'bus': 'virtio'}, 'serial': 'ASM_FRA', 'shareable': true},
+                    {'name': 'asm-vote', 'disk': {'bus': 'virtio'}, 'serial': 'ASM_VOTE', 'shareable': true}
+                  ]
+                }
+              },
+              'volumes': _vm_definition.spec.template.spec.volumes + [
+                {'name': 'asm-data', 'hostDisk': {'path': rac_shared_disk_path + '/asm-data.img', 'type': 'Disk', 'shared': true}},
+                {'name': 'asm-fra', 'hostDisk': {'path': rac_shared_disk_path + '/asm-fra.img', 'type': 'Disk', 'shared': true}},
+                {'name': 'asm-vote', 'hostDisk': {'path': rac_shared_disk_path + '/asm-vote.img', 'type': 'Disk', 'shared': true}}
+              ]
+            }
+          }
+        }
+      }, recursive=True) }}
+  when: _is_rac_node | bool
+
+# ---- Create the VM ----
+- name: "{{ current_node_name }} — Create VirtualMachine"
+  kubernetes.core.k8s:
+    state: present
+    definition: "{{ _vm_definition }}"
+
+- name: "{{ current_node_name }} — VM submitted"
+  ansible.builtin.debug:
+    msg: "VM {{ _vm_name }} created in namespace {{ kubevirt_namespace }}"

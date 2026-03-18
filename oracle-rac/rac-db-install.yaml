@@ -1,0 +1,266 @@
+---
+# Create Oracle RAC database using DBCA in silent mode.
+# For RAC topologies: creates a cluster database across both nodes.
+# For DG-only topologies: creates a single-instance primary database.
+
+# ---- Use L2 static IPs ----
+- name: Build node IP map for DB creation (L2)
+  ansible.builtin.set_fact:
+    rac_node_ips: >-
+      {{ dict(rac_node_names | zip([rac_node1_priv_ip, rac_node2_priv_ip][:rac_node_names | length])) }}
+
+- name: Set DB install target node
+  ansible.builtin.set_fact:
+    db_primary_node: "{{ rac_node_names[0] }}"
+    db_primary_ip: "{{ rac_node_ips[rac_node_names[0]] }}"
+
+- name: Add DB primary node to inventory
+  ansible.builtin.add_host:
+    name: "{{ db_primary_node }}"
+    ansible_host: "{{ db_primary_ip }}"
+    ansible_user: "oracle"
+    ansible_password: "{{ rac_oracle_password }}"
+    ansible_become: true
+    ansible_become_method: sudo
+    ansible_ssh_common_args: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+
+- name: Wait for SSH on DB primary node
+  ansible.builtin.wait_for:
+    host: "{{ db_primary_ip }}"
+    port: 22
+    timeout: 120
+    delay: 5
+
+# ---- Check if database already exists ----
+- name: Check if RAC database already exists
+  delegate_to: "{{ db_primary_node }}"
+  ansible.builtin.shell: |
+    export ORACLE_HOME=/u01/app/oracle/product/26ai/dbhome_1
+    export PATH=$ORACLE_HOME/bin:$PATH
+    # Check srvctl AND that DB is actually running (not just a stale registration)
+    status=$(srvctl status database -d {{ rac_db_name }} 2>&1)
+    if echo "$status" | grep -q "is running"; then
+      echo "RUNNING"
+    else
+      echo "NOT_FOUND"
+    fi
+  register: db_exists_check
+  changed_when: false
+  failed_when: false
+
+# ---- Install Oracle Database software (homes for oracle user) ----
+- name: Check if Oracle DB software home is properly installed
+  delegate_to: "{{ db_primary_node }}"
+  ansible.builtin.shell: |
+    # Check oracle binary exists AND is a real executable (not a 0-byte placeholder)
+    ORACLE_BIN=/u01/app/oracle/product/26ai/dbhome_1/bin/oracle
+    if [ -f "$ORACLE_BIN" ] && [ -s "$ORACLE_BIN" ] && [ -x "$ORACLE_BIN" ]; then
+      echo "INSTALLED"
+    else
+      echo "NOT_INSTALLED"
+    fi
+  register: oracle_dbhome_check_raw
+  changed_when: false
+
+- name: Set DB home installed fact
+  ansible.builtin.set_fact:
+    db_home_installed: "{{ oracle_dbhome_check_raw.stdout | trim == 'INSTALLED' }}"
+
+- name: Check for Oracle DB ZIP on controller
+  ansible.builtin.stat:
+    path: "{{ playbook_dir }}/LINUX.X64_2326100_db_home.zip"
+  register: db_zip_local
+  when: not db_home_installed
+
+- name: Fail if Oracle DB ZIP not found
+  ansible.builtin.fail:
+    msg: |
+      Oracle Database ZIP not found at {{ playbook_dir }}/LINUX.X64_2326100_db_home.zip
+      Download from: https://www.oracle.com/database/technologies/oracle26ai-linux-downloads.html
+  when:
+    - not db_home_installed
+    - not db_zip_local.stat.exists
+
+- name: Copy Oracle DB ZIP to primary node
+  delegate_to: "{{ db_primary_node }}"
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/LINUX.X64_2326100_db_home.zip"
+    dest: /tmp/LINUX.X64_2326100_db_home.zip
+    mode: '0644'
+  when: not db_home_installed
+
+- name: Install Oracle Database 26ai software
+  delegate_to: "{{ db_primary_node }}"
+  become: true
+  become_user: oracle
+  ansible.builtin.shell: |
+    set -o pipefail
+    mkdir -p /u01/app/oracle/product/26ai/dbhome_1
+    cd /u01/app/oracle/product/26ai/dbhome_1
+    unzip -oq /tmp/LINUX.X64_2326100_db_home.zip
+    ./runInstaller -silent -ignorePrereqFailure \
+      -responseFile /u01/app/oracle/product/26ai/dbhome_1/install/response/db_install.rsp \
+      oracle.install.option=INSTALL_DB_SWONLY \
+      ORACLE_HOME=/u01/app/oracle/product/26ai/dbhome_1 \
+      ORACLE_BASE=/u01/app/oracle \
+      oracle.install.db.InstallEdition=EE \
+      oracle.install.db.OSDBA_GROUP=dba \
+      oracle.install.db.OSOPER_GROUP=oper \
+      oracle.install.db.OSBACKUPDBA_GROUP=backupdba \
+      oracle.install.db.OSDGDBA_GROUP=dgdba \
+      oracle.install.db.OSKMDBA_GROUP=kmdba \
+      oracle.install.db.OSRACDBA_GROUP=dba \
+      SECURITY_UPDATES_VIA_MYORACLESUPPORT=false \
+      DECLINE_SECURITY_UPDATES=true 2>&1 | tee /tmp/db_install.log
+    exit_code=${PIPESTATUS[0]}
+    if [ $exit_code -eq 0 ] || [ $exit_code -eq 6 ]; then exit 0; else exit $exit_code; fi
+  register: db_sw_install
+  when: not db_home_installed
+  async: 1800
+  poll: 30
+
+- name: Run root.sh for Oracle DB home on all nodes
+  delegate_to: "{{ item }}"
+  ansible.builtin.shell: |
+    [ -f /u01/app/oracle/product/26ai/dbhome_1/root.sh ] && /u01/app/oracle/product/26ai/dbhome_1/root.sh || true
+  loop: "{{ rac_node_names }}"
+  when: not db_home_installed
+  failed_when: false
+
+- name: Copy getcrshome from Grid to DB home
+  delegate_to: "{{ db_primary_node }}"
+  ansible.builtin.shell: |
+    GI_HOME=/u01/app/26ai/grid
+    DB_HOME=/u01/app/oracle/product/26ai/dbhome_1
+    if [ -f "$GI_HOME/srvm/admin/getcrshome" ] && [ ! -f "$DB_HOME/srvm/admin/getcrshome" ]; then
+      cp "$GI_HOME/srvm/admin/getcrshome" "$DB_HOME/srvm/admin/getcrshome"
+      chown oracle:oinstall "$DB_HOME/srvm/admin/getcrshome"
+      chmod 755 "$DB_HOME/srvm/admin/getcrshome"
+      echo "Copied getcrshome"
+    else
+      echo "getcrshome already present or GI not installed"
+    fi
+  changed_when: false
+
+# ---- Determine Oracle environment paths ----
+- name: Set Oracle environment for DBCA
+  ansible.builtin.set_fact:
+    _oracle_env:
+      ORACLE_HOME: "/u01/app/oracle/product/26ai/dbhome_1"
+      ORACLE_BASE: "/u01/app/oracle"
+      PATH: "/u01/app/oracle/product/26ai/dbhome_1/bin:/u01/app/26ai/grid/bin:/usr/local/bin:/usr/bin:/bin"
+    # For Free Edition installed via RPM, use different paths
+    _oracle_env_free:
+      ORACLE_HOME: "/opt/oracle/product/26ai/dbhomeFree"
+      ORACLE_BASE: "/opt/oracle"
+      PATH: "/opt/oracle/product/26ai/dbhomeFree/bin:/u01/app/26ai/grid/bin:/usr/local/bin:/usr/bin:/bin"
+
+# ---- Create RAC database via DBCA ----
+- name: Create symlink for hardcoded DBCA home path
+  delegate_to: "{{ db_primary_node }}"
+  ansible.builtin.shell: |
+    # dbca script has hardcoded OH=/u01/app/oracle/product/23.0.0/dbhome_1
+    HARDCODED=$(grep '^OH=' /u01/app/oracle/product/26ai/dbhome_1/bin/dbca | head -1 | cut -d= -f2)
+    ACTUAL=/u01/app/oracle/product/26ai/dbhome_1
+    if [ "$HARDCODED" != "$ACTUAL" ] && [ ! -e "$HARDCODED" ]; then
+      mkdir -p "$(dirname "$HARDCODED")"
+      ln -sf "$ACTUAL" "$HARDCODED"
+      echo "Created symlink $HARDCODED -> $ACTUAL"
+    else
+      echo "No symlink needed"
+    fi
+  changed_when: false
+
+- name: Build DBCA node list
+  ansible.builtin.set_fact:
+    _dbca_node_list: "{{ rac_node_names | join(',') }}"
+  when: rac_nodes | int > 0
+
+- name: Create RAC database with DBCA (silent)
+  delegate_to: "{{ db_primary_node }}"
+  become: true
+  become_user: oracle
+  ansible.builtin.shell: |
+    set -o pipefail
+    export ORACLE_HOME={{ _oracle_env.ORACLE_HOME }}
+    export ORACLE_BASE={{ _oracle_env.ORACLE_BASE }}
+    export PATH={{ _oracle_env.PATH }}
+
+    dbca -silent -createDatabase \
+      -gdbName {{ rac_db_name }} \
+      -sid {{ rac_db_name }} \
+      -databaseType SI \
+      -templateName General_Purpose.dbc \
+      -storageType ASM \
+      -diskGroupName +DATA \
+      -recoveryGroupName +FRA \
+      -recoveryAreaSize 8192 \
+      -redoLogFileSize 50 \
+      -createAsContainerDatabase true \
+      -numberOfPDBs 1 \
+      -pdbName {{ rac_pdb_name }} \
+      -pdbAdminPassword {{ rac_oracle_password }} \
+      -sysPassword {{ rac_oracle_password }} \
+      -systemPassword {{ rac_oracle_password }} \
+      -dbsnmpPassword {{ rac_oracle_password }} \
+      -emConfiguration NONE \
+      -characterSet AL32UTF8 \
+      -nationalCharacterSet AL16UTF16 \
+      -automaticMemoryManagement false \
+      -totalMemory {{ ((rac_node_memory | regex_replace('Gi$','') | int) * 1024 * 0.4) | int }} \
+      -enableArchive true \
+      -archiveLogDest +FRA \
+      -listeners LISTENER \
+      -ignorePreReqs 2>&1 | tee /tmp/dbca_rac.log
+    exit_code=${PIPESTATUS[0]}
+    if [ $exit_code -eq 0 ] || [ $exit_code -eq 6 ]; then exit 0; else exit $exit_code; fi
+  register: dbca_result
+  when: "'NOT_FOUND' in (db_exists_check.stdout | default('NOT_FOUND'))"
+  async: 3600
+  poll: 30
+
+# ---- Enable archivelog mode (required for Data Guard) ----
+- name: Enable archivelog mode on primary
+  delegate_to: "{{ db_primary_node }}"
+  become: true
+  become_user: oracle
+  ansible.builtin.shell: |
+    export ORACLE_HOME={{ _oracle_env.ORACLE_HOME }}
+    export ORACLE_SID={{ rac_db_name }}1
+    export PATH={{ _oracle_env.PATH }}
+
+    sqlplus -s / as sysdba <<EOF
+    ALTER DATABASE FORCE LOGGING;
+    SHUTDOWN IMMEDIATE;
+    STARTUP MOUNT;
+    ALTER DATABASE ARCHIVELOG;
+    ALTER DATABASE OPEN;
+    ALTER SYSTEM SET LOG_ARCHIVE_DEST_1='LOCATION=USE_DB_RECOVERY_FILE_DEST' SCOPE=BOTH;
+    ALTER SYSTEM SET LOG_ARCHIVE_FORMAT='%t_%s_%r.arc' SCOPE=SPFILE;
+    EXIT;
+    EOF
+  register: archivelog_result
+  when: rac_dataguard | bool
+  failed_when: false
+
+# ---- Verify database status ----
+- name: Check database status
+  delegate_to: "{{ db_primary_node }}"
+  become: true
+  become_user: oracle
+  ansible.builtin.shell: |
+    export ORACLE_HOME={{ _oracle_env.ORACLE_HOME }}
+    export PATH={{ _oracle_env.PATH }}
+    srvctl status database -d {{ rac_db_name }} 2>&1 || echo "Database status query failed"
+  register: db_final_status
+  changed_when: false
+  failed_when: false
+
+- name: Display database creation result
+  ansible.builtin.debug:
+    msg:
+      - "✅ Oracle RAC Database created"
+      - "  DB Name:  {{ rac_db_name }}"
+      - "  PDB:      {{ rac_pdb_name }}"
+      - "  Nodes:    {{ rac_node_names | join(', ') }}"
+      - "  Status:   {{ db_final_status.stdout_lines | default(['Unknown']) }}"

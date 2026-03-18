@@ -1,24 +1,24 @@
 apiVersion: infra.example.com/v1
 kind: OracleDB
 metadata:
-  name: oracle-db-23ai
+  name: oracle-db-26ai
 spec:
   action: install
   kind: VirtualMachine
   vm_name: rhel9-vm
   kubevirt_namespace: default
-  oracle_vault_secret: secret/data/oracle-db-23ai/admin
+  oracle_vault_secret: secret/data/oracle-db-26ai/admin
   oracle_user: oracle
   oracle_password: "Oracle123"
   oracle_admin_password: "Oracle123"
   oracle_sid: FREE
-  oracle_home: /opt/oracle/product/23ai/dbhomeFree
+  oracle_home: /opt/oracle/product/26ai/dbhomeFree
   oracle_env:
-    ORACLE_HOME: /opt/oracle/product/23ai/dbhomeFree
+    ORACLE_HOME: /opt/oracle/product/26ai/dbhomeFree
     ORACLE_SID: FREE
     ORACLE_BASE: /opt/oracle
-    TNS_ADMIN: /opt/oracle/product/23ai/dbhomeFree/network/admin
-    PATH: "/opt/oracle/product/23ai/dbhomeFree/bin:/usr/local/bin:/usr/bin:/bin:/sbin"
+    TNS_ADMIN: /opt/oracle/product/26ai/dbhomeFree/network/admin
+    PATH: "/opt/oracle/product/26ai/dbhomeFree/bin:/usr/local/bin:/usr/bin:/bin:/sbin"
   oracle_pdb_name: FREEPDB1
   oracle_dbca_template: FREE_Database.dbc
   oracle_dbca_memory_mb: 0

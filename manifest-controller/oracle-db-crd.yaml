@@ -45,13 +45,13 @@ spec:
                 default: FREE
               oracle_home:
                 type: string
-                default: /opt/oracle/product/23ai/dbhomeFree
+                default: /opt/oracle/product/26ai/dbhomeFree
               oracle_env:
                 type: object
                 properties:
                   ORACLE_HOME:
                     type: string
-                    default: /opt/oracle/product/23ai/dbhomeFree
+                    default: /opt/oracle/product/26ai/dbhomeFree
                   ORACLE_SID:
                     type: string
                     default: FREE
@@ -60,10 +60,10 @@ spec:
                     default: /opt/oracle
                   TNS_ADMIN:
                     type: string
-                    default: /opt/oracle/product/23ai/dbhomeFree/network/admin
+                    default: /opt/oracle/product/26ai/dbhomeFree/network/admin
                   PATH:
                     type: string
-                    default: "/opt/oracle/product/23ai/dbhomeFree/bin:/usr/local/bin:/usr/bin:/bin:/sbin"
+                    default: "/opt/oracle/product/26ai/dbhomeFree/bin:/usr/local/bin:/usr/bin:/bin:/sbin"
               oracle_pdb_name:
                 type: string
                 default: FREEPDB1

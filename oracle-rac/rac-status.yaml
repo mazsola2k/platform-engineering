@@ -1,0 +1,193 @@
+---
+# Oracle RAC Cluster Status — aggregated view of all components.
+# Queries each VM status, SSH into primary for CRS/DB/DG status.
+
+# ---- Check all VMs ----
+- name: Build full VM list for status check
+  ansible.builtin.set_fact:
+    _status_vm_list: >-
+      {{ rac_node_names
+       + ((rac_dataguard | bool) | ternary([rac_standby_name], []))
+       + ((rac_fsfo | bool) | ternary([rac_observer_name], [])) }}
+
+- name: Check VM status for all RAC components
+  kubernetes.core.k8s_info:
+    api_version: kubevirt.io/v1
+    kind: VirtualMachine
+    name: "{{ item }}"
+    namespace: "{{ kubevirt_namespace }}"
+  register: _status_vms
+  loop: "{{ _status_vm_list }}"
+  loop_control:
+    label: "{{ item }}"
+  failed_when: false
+
+- name: Build VM status summary
+  ansible.builtin.set_fact:
+    _vm_status_lines: >-
+      {{ _vm_status_lines | default([]) + [
+        item.item ~ ': ' ~ (
+          (item.resources | length > 0) | ternary(
+            item.resources[0].status.printableStatus | default('Unknown'),
+            'Not Found'
+          )
+        )
+      ] }}
+  loop: "{{ _status_vms.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: Display VM status
+  ansible.builtin.debug:
+    msg:
+      - "====== Oracle RAC VM Status ======"
+      - "{{ _vm_status_lines }}"
+
+# ---- Get primary IP and check cluster services ----
+- name: Get primary VMI for cluster status
+  kubernetes.core.k8s_info:
+    api_version: kubevirt.io/v1
+    kind: VirtualMachineInstance
+    name: "{{ rac_node_names[0] }}"
+    namespace: "{{ kubevirt_namespace }}"
+  register: _status_primary_vmi
+  failed_when: false
+
+- name: Set primary IP for status queries
+  ansible.builtin.set_fact:
+    _status_primary_ip: "{{ _status_primary_vmi.resources[0].status.interfaces[0].ipAddress | default('') }}"
+  when: _status_primary_vmi.resources | length > 0
+
+- name: Add primary to inventory for status
+  ansible.builtin.add_host:
+    name: "{{ rac_node_names[0] }}"
+    ansible_host: "{{ _status_primary_ip }}"
+    ansible_user: "oracle"
+    ansible_password: "{{ rac_oracle_password }}"
+    ansible_become: true
+    ansible_become_method: sudo
+    ansible_ssh_common_args: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+  when: _status_primary_ip | default('') | length > 0
+
+# ---- CRS status (RAC only) ----
+- name: Check Cluster Ready Services status
+  delegate_to: "{{ rac_node_names[0] }}"
+  ansible.builtin.shell: |
+    export ORACLE_HOME=/u01/app/26ai/grid
+    export PATH=$ORACLE_HOME/bin:$PATH
+    crsctl stat res -t 2>&1 | head -80
+  register: crs_status
+  changed_when: false
+  failed_when: false
+  when: rac_nodes | int > 0 and _status_primary_ip | default('') | length > 0
+
+- name: Display CRS status
+  ansible.builtin.debug:
+    msg:
+      - "====== Cluster Ready Services ======"
+      - "{{ crs_status.stdout_lines | default(['CRS not reachable or not installed']) }}"
+  when: rac_nodes | int > 0
+
+# ---- Database status ----
+- name: Check database status
+  delegate_to: "{{ rac_node_names[0] }}"
+  ansible.builtin.shell: |
+    export ORACLE_HOME={{ _oracle_env.ORACLE_HOME | default('/u01/app/oracle/product/26ai/dbhome_1') }}
+    export PATH=$ORACLE_HOME/bin:$PATH
+    srvctl status database -d {{ rac_db_name }} 2>&1
+  register: db_status
+  changed_when: false
+  failed_when: false
+  when: _status_primary_ip | default('') | length > 0
+
+- name: Display database status
+  ansible.builtin.debug:
+    msg:
+      - "====== Database Status ======"
+      - "{{ db_status.stdout_lines | default(['Database not reachable']) }}"
+
+# ---- ASM status (RAC only) ----
+- name: Check ASM disk group status
+  delegate_to: "{{ rac_node_names[0] }}"
+  become: true
+  become_user: grid
+  ansible.builtin.shell: |
+    export ORACLE_HOME=/u01/app/26ai/grid
+    export ORACLE_SID=+ASM1
+    export PATH=$ORACLE_HOME/bin:$PATH
+    sqlplus -s / as sysasm <<EOF
+    SET LINESIZE 120
+    SELECT NAME, STATE, TYPE, TOTAL_MB, FREE_MB FROM V\$ASM_DISKGROUP;
+    EXIT;
+    EOF
+  register: asm_status
+  changed_when: false
+  failed_when: false
+  when: rac_nodes | int > 0 and _status_primary_ip | default('') | length > 0
+
+- name: Display ASM status
+  ansible.builtin.debug:
+    msg:
+      - "====== ASM Disk Groups ======"
+      - "{{ asm_status.stdout_lines | default(['ASM not reachable']) }}"
+  when: rac_nodes | int > 0
+
+# ---- Data Guard status (if enabled) ----
+- name: Check Data Guard Broker status
+  delegate_to: "{{ rac_node_names[0] }}"
+  become: true
+  become_user: oracle
+  ansible.builtin.shell: |
+    export ORACLE_HOME={{ _oracle_env.ORACLE_HOME | default('/u01/app/oracle/product/26ai/dbhome_1') }}
+    export PATH=$ORACLE_HOME/bin:$PATH
+    dgmgrl sys/{{ rac_oracle_password }}@{{ rac_db_name }}_PRIMARY "SHOW CONFIGURATION" 2>&1
+  register: dg_status
+  changed_when: false
+  failed_when: false
+  when: rac_dataguard | bool and _status_primary_ip | default('') | length > 0
+
+- name: Display Data Guard status
+  ansible.builtin.debug:
+    msg:
+      - "====== Data Guard Configuration ======"
+      - "{{ dg_status.stdout_lines | default(['DG Broker not reachable']) }}"
+  when: rac_dataguard | bool
+
+# ---- FSFO Observer status (if enabled) ----
+- name: Get observer VMI for status
+  kubernetes.core.k8s_info:
+    api_version: kubevirt.io/v1
+    kind: VirtualMachineInstance
+    name: "{{ rac_observer_name }}"
+    namespace: "{{ kubevirt_namespace }}"
+  register: _status_observer_vmi
+  failed_when: false
+  when: rac_fsfo | bool
+
+- name: Check FSFO observer service status
+  delegate_to: "{{ rac_observer_name }}"
+  ansible.builtin.shell: systemctl status oracle-fsfo-observer --no-pager 2>&1 | head -20
+  register: observer_status
+  changed_when: false
+  failed_when: false
+  when: >-
+    rac_fsfo | bool and
+    _status_observer_vmi.resources | default([]) | length > 0
+
+- name: Display FSFO Observer status
+  ansible.builtin.debug:
+    msg:
+      - "====== FSFO Observer ======"
+      - "{{ observer_status.stdout_lines | default(['Observer not reachable']) }}"
+  when: rac_fsfo | bool
+
+# ---- Summary ----
+- name: Display topology summary
+  ansible.builtin.debug:
+    msg:
+      - "====== Topology Summary ======"
+      - "  RAC nodes:     {{ rac_nodes }}"
+      - "  Data Guard:    {{ rac_dataguard }}"
+      - "  FSFO:          {{ rac_fsfo }}"
+      - "  Total VMs:     {{ _status_vm_list | length }}"
+      - "  VM list:       {{ _status_vm_list | join(', ') }}"

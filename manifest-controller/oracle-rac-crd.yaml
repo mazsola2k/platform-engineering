@@ -1,0 +1,142 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: oracleracs.infra.example.com
+spec:
+  group: infra.example.com
+  names:
+    plural: oracleracs
+    singular: oraclerac
+    kind: OracleRAC
+    shortNames:
+      - orac
+  scope: Namespaced
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              properties:
+                # --- Topology ---
+                rac_action:
+                  type: string
+                  default: install
+                  enum: ["install", "uninstall", "status"]
+                rac_nodes:
+                  type: integer
+                  default: 2
+                  description: "Number of RAC nodes (0 or 2). 0 = single-instance primary for DG topologies."
+                rac_dataguard:
+                  type: boolean
+                  default: true
+                rac_fsfo:
+                  type: boolean
+                  default: true
+                kubevirt_namespace:
+                  type: string
+                  default: default
+                # --- VM sizing ---
+                rac_node_cpu:
+                  type: integer
+                  default: 4
+                rac_node_memory:
+                  type: string
+                  default: "8Gi"
+                rac_node_disk:
+                  type: string
+                  default: "40Gi"
+                rac_standby_cpu:
+                  type: integer
+                  default: 4
+                rac_standby_memory:
+                  type: string
+                  default: "8Gi"
+                rac_standby_disk:
+                  type: string
+                  default: "40Gi"
+                rac_observer_cpu:
+                  type: integer
+                  default: 1
+                rac_observer_memory:
+                  type: string
+                  default: "1Gi"
+                rac_observer_disk:
+                  type: string
+                  default: "10Gi"
+                # --- ASM shared disks ---
+                rac_asm_data_size:
+                  type: string
+                  default: "20G"
+                rac_asm_fra_size:
+                  type: string
+                  default: "10G"
+                rac_asm_vote_size:
+                  type: string
+                  default: "2G"
+                rac_shared_disk_path:
+                  type: string
+                  default: "/var/lib/kubevirt/rac-shared"
+                # --- Network ---
+                rac_interconnect_subnet:
+                  type: string
+                  default: "192.168.10.0/24"
+                rac_interconnect_bridge:
+                  type: string
+                  default: "br-rac"
+                # --- Oracle ---
+                rac_db_name:
+                  type: string
+                  default: "RACDB"
+                rac_pdb_name:
+                  type: string
+                  default: "RACPDB1"
+                rac_scan_name:
+                  type: string
+                  default: "rac-scan"
+                rac_cluster_name:
+                  type: string
+                  default: "rac-cluster"
+                rac_oracle_password:
+                  type: string
+                  default: "Oracle123"
+                rac_vault_secret:
+                  type: string
+                  default: "secret/data/oracle-rac/admin"
+                # --- Base OS ---
+                qcow2_image_path:
+                  type: string
+                  default: "./rhel-9.6-x86_64-kvm.qcow2"
+                storage_dir:
+                  type: string
+                  default: "/data/vms"
+                # --- Subscription ---
+                subscription_username:
+                  type: string
+                subscription_password:
+                  type: string
+              required:
+                - rac_nodes
+            status:
+              type: object
+              properties:
+                phase:
+                  type: string
+                  enum: ["Pending", "InProgress", "Ready", "Failed", "Terminating", "Unknown"]
+                message:
+                  type: string
+                topology:
+                  type: string
+                  description: "Resolved topology letter (A-F)"
+                nodeCount:
+                  type: integer
+                vmNames:
+                  type: array
+                  items:
+                    type: string
+      subresources:
+        status: {}

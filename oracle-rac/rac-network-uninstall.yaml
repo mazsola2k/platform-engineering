@@ -1,0 +1,23 @@
+---
+# Remove L2 VXLAN bridge network for RAC interconnect.
+
+- name: Delete RAC interconnect NetworkAttachmentDefinition
+  kubernetes.core.k8s:
+    state: absent
+    api_version: k8s.cni.cncf.io/v1
+    kind: NetworkAttachmentDefinition
+    name: rac-interconnect
+    namespace: "{{ kubevirt_namespace }}"
+  failed_when: false
+
+- name: Remove vxlan100 and br-vm bridge
+  ansible.builtin.shell: |
+    ip link delete vxlan100 2>/dev/null || true
+    ip link delete br-vm 2>/dev/null || true
+    echo "L2 VXLAN bridge removed"
+  become: true
+  changed_when: false
+
+- name: Display network cleanup status
+  ansible.builtin.debug:
+    msg: "✅ L2 VXLAN network removed (br-vm, vxlan100, NAD)"

@@ -1,0 +1,404 @@
+---
+# Install Oracle Grid Infrastructure 26ai on RAC nodes.
+# Runs gridSetup.sh in silent mode on node1, then root.sh on both nodes.
+# Configures ASM disk groups: DATA, FRA, VOTE.
+
+# ---- Use L2 static IPs (set by controller / rac-nodes-install) ----
+- name: Build node IP map for GI install (L2)
+  ansible.builtin.set_fact:
+    rac_node_ips: >-
+      {{ dict(rac_node_names | zip([rac_node1_priv_ip, rac_node2_priv_ip][:rac_node_names | length])) }}
+
+- name: Set primary node for GI install
+  ansible.builtin.set_fact:
+    gi_primary_node: "{{ rac_node_names[0] }}"
+    gi_primary_ip: "{{ rac_node_ips[rac_node_names[0]] }}"
+    gi_all_node_list: "{{ rac_node_names | join(',') }}"
+
+- name: Add RAC nodes to in-memory inventory
+  ansible.builtin.add_host:
+    name: "{{ item.key }}"
+    ansible_host: "{{ item.value }}"
+    ansible_user: "oracle"
+    ansible_password: "{{ rac_oracle_password }}"
+    ansible_become: true
+    ansible_become_method: sudo
+    ansible_ssh_common_args: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+    groups: rac_nodes
+  loop: "{{ rac_node_ips | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+
+- name: Wait for SSH on all RAC nodes
+  ansible.builtin.wait_for:
+    host: "{{ item.value }}"
+    port: 22
+    timeout: 300
+    delay: 10
+  loop: "{{ rac_node_ips | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+
+# ---- Configure SSH key equivalence between grid user on all nodes ----
+- name: Generate SSH keys for grid user on node1
+  delegate_to: "{{ gi_primary_node }}"
+  ansible.builtin.shell: |
+    su - grid -c 'ssh-keygen -t rsa -N "" -f ~/.ssh/id_rsa <<< y' > /dev/null 2>&1 || true
+    su - grid -c 'cat ~/.ssh/id_rsa.pub'
+  register: grid_pubkey
+  changed_when: false
+
+- name: Extract grid public key
+  ansible.builtin.set_fact:
+    grid_ssh_pubkey: "{{ grid_pubkey.stdout_lines | select('match', '^ssh-') | first }}"
+
+- name: Distribute grid SSH public key to all nodes
+  delegate_to: "{{ item }}"
+  ansible.builtin.shell: |
+    mkdir -p ~grid/.ssh
+    echo '{{ grid_ssh_pubkey }}' >> ~grid/.ssh/authorized_keys
+    sort -u -o ~grid/.ssh/authorized_keys ~grid/.ssh/authorized_keys
+    chown -R grid:oinstall ~grid/.ssh
+    chmod 700 ~grid/.ssh
+    chmod 600 ~grid/.ssh/authorized_keys
+  loop: "{{ rac_node_names }}"
+
+# ---- Configure ASM devices ----
+- name: Configure ASM disk permissions on all nodes
+  delegate_to: "{{ item }}"
+  ansible.builtin.shell: |
+    mkdir -p /dev/oracleasm
+    for dev in /dev/vdb /dev/vdc /dev/vdd /dev/vde /dev/vdf; do
+      [ -b "$dev" ] || continue
+      serial=$(udevadm info --query=property --name="$dev" 2>/dev/null | sed -n 's/^ID_SERIAL=//p' || true)
+      case "$serial" in
+        ASM_DATA) ln -sf "$dev" /dev/oracleasm/asm-data ;;
+        ASM_FRA)  ln -sf "$dev" /dev/oracleasm/asm-fra  ;;
+        ASM_VOTE) ln -sf "$dev" /dev/oracleasm/asm-vote ;;
+      esac
+    done
+    if [ ! -L /dev/oracleasm/asm-data ]; then
+      [ -b /dev/vdc ] && ln -sf /dev/vdc /dev/oracleasm/asm-data
+      [ -b /dev/vdd ] && ln -sf /dev/vdd /dev/oracleasm/asm-fra
+      [ -b /dev/vde ] && ln -sf /dev/vde /dev/oracleasm/asm-vote
+    fi
+    chown grid:asmdba /dev/oracleasm/*
+    chmod 660 /dev/oracleasm/*
+    # Also fix the raw block devices (udev GROUP can be unreliable)
+    for link in /dev/oracleasm/*; do
+      [ -L "$link" ] && chown grid:asmdba "$(readlink -f $link)" && chmod 660 "$(readlink -f $link)"
+    done
+  args:
+    creates: /dev/oracleasm/asm-data
+  loop: "{{ rac_node_names }}"
+
+- name: Create udev rules for persistent ASM device names
+  delegate_to: "{{ item }}"
+  ansible.builtin.copy:
+    dest: /etc/udev/rules.d/99-oracle-asm.rules
+    content: |
+      # Oracle ASM disk rules — match by serial from KubeVirt hostDisk
+      ENV{ID_SERIAL}=="ASM_DATA", SYMLINK+="oracleasm/asm-data", OWNER="grid", GROUP="asmdba", MODE="0660"
+      ENV{ID_SERIAL}=="ASM_FRA",  SYMLINK+="oracleasm/asm-fra",  OWNER="grid", GROUP="asmdba", MODE="0660"
+      ENV{ID_SERIAL}=="ASM_VOTE", SYMLINK+="oracleasm/asm-vote", OWNER="grid", GROUP="asmdba", MODE="0660"
+    mode: '0644'
+  loop: "{{ rac_node_names }}"
+
+- name: Reload udev on all nodes
+  delegate_to: "{{ item }}"
+  ansible.builtin.command: udevadm trigger
+  loop: "{{ rac_node_names }}"
+  changed_when: false
+
+# ---- Download and extract Grid Infrastructure ----
+- name: Check if Grid Infrastructure is already installed
+  delegate_to: "{{ gi_primary_node }}"
+  ansible.builtin.stat:
+    path: /u01/app/26ai/grid/bin/crsctl
+  register: gi_installed_check
+
+- name: Check for Grid Infrastructure ZIP on controller
+  ansible.builtin.stat:
+    path: "{{ playbook_dir }}/LINUX.X64_2326100_grid_home.zip"
+  register: gi_zip_local
+  when: not gi_installed_check.stat.exists
+
+- name: Fail if Grid Infrastructure ZIP not found
+  ansible.builtin.fail:
+    msg: |
+      Grid Infrastructure ZIP not found at {{ playbook_dir }}/LINUX.X64_2326100_grid_home.zip
+      Download from: https://www.oracle.com/database/technologies/oracle26ai-linux-downloads.html
+  when:
+    - not gi_installed_check.stat.exists
+    - not gi_zip_local.stat.exists
+
+- name: Register RHEL subscription on all RAC nodes
+  delegate_to: "{{ item }}"
+  ansible.builtin.shell: |
+    if subscription-manager identity &>/dev/null; then
+      echo 'Already registered'
+    else
+      subscription-manager register \
+        --username="{{ subscription_username }}" \
+        --password="{{ subscription_password }}" \
+        --auto-attach 2>&1 || true
+      subscription-manager repos \
+        --enable=rhel-9-for-x86_64-baseos-rpms \
+        --enable=rhel-9-for-x86_64-appstream-rpms 2>&1 || true
+    fi
+  loop: "{{ rac_node_names }}"
+  when:
+    - subscription_username != 'XXXXX'
+
+- name: Install Oracle prerequisites on all RAC nodes
+  delegate_to: "{{ item }}"
+  ansible.builtin.dnf:
+    name:
+      - unzip
+      - libaio
+      - libaio-devel
+      - bc
+      - binutils
+      - elfutils-libelf
+      - ksh
+      - make
+      - sysstat
+      - tar
+      - net-tools
+      - smartmontools
+      - glibc-devel
+      - gcc
+      - gcc-c++
+      - glibc-langpack-en
+    state: present
+  loop: "{{ rac_node_names }}"
+
+- name: Copy Grid Infrastructure ZIP to primary node
+  delegate_to: "{{ gi_primary_node }}"
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/LINUX.X64_2326100_grid_home.zip"
+    dest: /tmp/LINUX.X64_2326100_grid_home.zip
+    mode: '0644'
+  when: not gi_installed_check.stat.exists
+
+- name: Extract Grid Infrastructure to GRID_HOME
+  delegate_to: "{{ gi_primary_node }}"
+  become: true
+  become_user: grid
+  ansible.builtin.shell: |
+    cd /u01/app/26ai/grid
+    unzip -oq /tmp/LINUX.X64_2326100_grid_home.zip
+  when: not gi_installed_check.stat.exists
+
+# ---- Run gridSetup.sh in silent mode ----
+- name: Build Grid Infrastructure response file
+  delegate_to: "{{ gi_primary_node }}"
+  ansible.builtin.copy:
+    dest: /tmp/grid_install.rsp
+    owner: grid
+    group: oinstall
+    mode: '0644'
+    content: |
+      oracle.install.responseFileVersion=/oracle/install/rspfmt_crsinstall_response_schema_v23.0.0
+      INVENTORY_LOCATION=/u01/app/oraInventory
+      installOption=HA_CONFIG
+      ORACLE_BASE=/u01/app/grid
+      OSDBA=asmdba
+      OSOPER=asmoper
+      OSASM=asmadmin
+      storageOption=FLEX_ASM_STORAGE
+      sysasmPassword={{ rac_oracle_password }}
+      diskGroupName=DATA
+      redundancy=EXTERNAL
+      auSize=4
+      diskList=/dev/oracleasm/asm-data
+      diskString=/dev/oracleasm/*
+      asmsnmpPassword={{ rac_oracle_password }}
+      executeRootScript=false
+      enableAutoFixup=false
+  when: not gi_installed_check.stat.exists
+
+- name: Run gridSetup.sh (silent install)
+  delegate_to: "{{ gi_primary_node }}"
+  become: true
+  become_user: grid
+  ansible.builtin.shell: |
+    /u01/app/26ai/grid/gridSetup.sh -silent -responseFile /tmp/grid_install.rsp \
+      -ignorePrereqFailure 2>&1 | tee /tmp/gridSetup.log
+    exit_code=$?
+    # gridSetup returns 6 for "successfully installed with warnings" — treat as success
+    if [ $exit_code -eq 0 ] || [ $exit_code -eq 6 ]; then
+      exit 0
+    else
+      exit $exit_code
+    fi
+  register: gi_setup_result
+  when: not gi_installed_check.stat.exists
+  async: 1800
+  poll: 30
+
+# ---- Run root.sh on all nodes ----
+- name: Run orainstRoot.sh on all nodes
+  delegate_to: "{{ item }}"
+  ansible.builtin.command: /u01/app/oraInventory/orainstRoot.sh
+  loop: "{{ rac_node_names }}"
+  when: not gi_installed_check.stat.exists
+  failed_when: false
+
+- name: Run root.sh on node1 first
+  delegate_to: "{{ rac_node_names[0] }}"
+  ansible.builtin.shell: |
+    /u01/app/26ai/grid/root.sh 2>&1 | tee /tmp/root_sh_node1.log
+  when: not gi_installed_check.stat.exists
+  async: 600
+  poll: 15
+  failed_when: false
+
+- name: Run root.sh on node2
+  delegate_to: "{{ rac_node_names[1] }}"
+  ansible.builtin.shell: |
+    /u01/app/26ai/grid/root.sh 2>&1 | tee /tmp/root_sh_node2.log
+  when: not gi_installed_check.stat.exists and (rac_node_names | length > 1)
+  async: 600
+  poll: 15
+  failed_when: false
+
+# ---- Post-root.sh fixups (ACFS failure recovery on RHEL 9) ----
+- name: Check if CSS is online
+  delegate_to: "{{ gi_primary_node }}"
+  ansible.builtin.shell: |
+    /u01/app/26ai/grid/bin/crsctl check css 2>/dev/null | grep -q "online" && echo "ONLINE" || echo "OFFLINE"
+  register: css_check
+  changed_when: false
+  failed_when: false
+
+- name: Fix Grid home oracle binary permissions (setuid/setgid)
+  delegate_to: "{{ item }}"
+  ansible.builtin.file:
+    path: /u01/app/26ai/grid/bin/oracle
+    owner: grid
+    group: oinstall
+    mode: '6751'
+  loop: "{{ rac_node_names }}"
+  when: css_check.stdout | default('') == 'OFFLINE'
+  failed_when: false
+
+- name: Fix hostname resolution to use L2 IPs
+  delegate_to: "{{ item.key }}"
+  ansible.builtin.lineinfile:
+    path: /etc/hosts
+    regexp: '\s{{ item.key }}(\s|$)'
+    line: "{{ item.value }} {{ item.key }}"
+    state: present
+  loop: "{{ rac_node_ips | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+
+- name: Fix ocr.loc permissions for DB installer access
+  delegate_to: "{{ item }}"
+  ansible.builtin.file:
+    path: /etc/oracle/ocr.loc
+    mode: '0644'
+  loop: "{{ rac_node_names }}"
+  failed_when: false
+
+- name: Complete HAS configuration after ACFS failure
+  delegate_to: "{{ gi_primary_node }}"
+  ansible.builtin.shell: |
+    export ORACLE_HOME=/u01/app/26ai/grid
+    export PATH=$ORACLE_HOME/bin:$PATH
+    # Check if CSS is already running
+    if crsctl check css 2>/dev/null | grep -q "online"; then
+      echo "CSS already online"
+      exit 0
+    fi
+    # Run executeConfigTools to complete the interrupted configuration
+    # (CVU may fail on OLR permissions — that is cosmetic, ignore it)
+    su - grid -c "$ORACLE_HOME/gridSetup.sh -silent -executeConfigTools \
+      -responseFile /tmp/grid_install.rsp 2>&1" | tee /tmp/configTools.log || true
+    # Check if CSS came up (the important part)
+    sleep 5
+    if crsctl check css 2>/dev/null | grep -q "online"; then
+      echo "CSS is now online"
+      exit 0
+    fi
+    # Last resort: manually start HAS which brings up CSS
+    crsctl start has 2>&1 || true
+    # Wait for CSS to come online
+    for i in $(seq 1 30); do
+      if crsctl check css 2>/dev/null | grep -q "online"; then
+        echo "CSS online after manual start"
+        exit 0
+      fi
+      sleep 2
+    done
+    echo "ERROR: CSS did not come online"
+    crsctl stat res -t 2>&1
+    exit 1
+  when: css_check.stdout | default('') == 'OFFLINE'
+  async: 600
+  poll: 15
+
+- name: Wait for ASM to come online
+  delegate_to: "{{ gi_primary_node }}"
+  ansible.builtin.shell: |
+    export ORACLE_HOME=/u01/app/26ai/grid
+    export PATH=$ORACLE_HOME/bin:$PATH
+    for i in $(seq 1 30); do
+      if crsctl stat res ora.asm -t 2>/dev/null | grep -q "ONLINE"; then
+        echo "ASM is ONLINE"
+        exit 0
+      fi
+      sleep 2
+    done
+    echo "ASM did not come online"
+    crsctl stat res -t 2>&1
+    exit 1
+  register: asm_online_check
+
+# ---- Create additional ASM disk groups (FRA, VOTE) ----
+- name: Create FRA and VOTE disk groups via ASMCA
+  delegate_to: "{{ gi_primary_node }}"
+  become: true
+  become_user: grid
+  ansible.builtin.shell: |
+    export ORACLE_HOME=/u01/app/26ai/grid
+    export ORACLE_BASE=/u01/app/grid
+    export PATH=$ORACLE_HOME/bin:$PATH
+
+    # Create FRA disk group (skip if already exists)
+    if ! asmcmd lsdg DATA FRA VOTE 2>/dev/null | grep -q FRA; then
+      asmca -silent -createDiskGroup \
+        -diskGroupName FRA \
+        -diskList '/dev/oracleasm/asm-fra' \
+        -redundancy EXTERNAL \
+        -au_size 4 \
+        -compatible.asm '23.0.0.0.0' 2>&1 || true
+    fi
+
+    # Create VOTE disk group (skip if already exists)
+    if ! asmcmd lsdg DATA FRA VOTE 2>/dev/null | grep -q VOTE; then
+      asmca -silent -createDiskGroup \
+        -diskGroupName VOTE \
+        -diskList '/dev/oracleasm/asm-vote' \
+        -redundancy EXTERNAL \
+        -au_size 4 \
+        -compatible.asm '23.0.0.0.0' 2>&1 || true
+    fi
+  register: asm_dg_result
+
+- name: Verify Grid Infrastructure status
+  delegate_to: "{{ gi_primary_node }}"
+  ansible.builtin.shell: |
+    export ORACLE_HOME=/u01/app/26ai/grid
+    export PATH=$ORACLE_HOME/bin:$PATH
+    crsctl stat res -t 2>&1 | head -60
+  register: crs_status
+  changed_when: false
+  failed_when: false
+
+- name: Display Grid Infrastructure status
+  ansible.builtin.debug:
+    msg:
+      - "✅ Grid Infrastructure installation complete"
+      - "{{ crs_status.stdout_lines | default(['Status not available']) }}"

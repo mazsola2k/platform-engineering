@@ -1,0 +1,53 @@
+---
+# Remove a single RAC node VM + its PV/PVC/hostPath.
+# Called in a loop from rac-nodes-uninstall.yaml with current_node_name.
+
+- name: "{{ current_node_name }} — Delete VirtualMachine"
+  kubernetes.core.k8s:
+    state: absent
+    api_version: kubevirt.io/v1
+    kind: VirtualMachine
+    name: "{{ current_node_name }}"
+    namespace: "{{ kubevirt_namespace }}"
+  failed_when: false
+
+- name: "{{ current_node_name }} — Wait for VM deletion"
+  kubernetes.core.k8s_info:
+    api_version: kubevirt.io/v1
+    kind: VirtualMachine
+    name: "{{ current_node_name }}"
+    namespace: "{{ kubevirt_namespace }}"
+  register: vm_del_check
+  until: vm_del_check.resources | length == 0
+  retries: 20
+  delay: 5
+  failed_when: false
+
+- name: "{{ current_node_name }} — Delete PVC"
+  kubernetes.core.k8s:
+    state: absent
+    api_version: v1
+    kind: PersistentVolumeClaim
+    name: "{{ current_node_name }}-system-disk"
+    namespace: "{{ kubevirt_namespace }}"
+  failed_when: false
+
+- name: "{{ current_node_name }} — Delete PV"
+  kubernetes.core.k8s:
+    state: absent
+    api_version: v1
+    kind: PersistentVolume
+    name: "{{ current_node_name }}-system-pv"
+  failed_when: false
+
+- name: "{{ current_node_name }} — Remove disk image"
+  ansible.builtin.file:
+    path: "{{ storage_dir }}/{{ current_node_name }}-system-disk/disk.img"
+    state: absent
+  failed_when: false
+
+- name: "{{ current_node_name }} — Remove hostPath directory"
+  ansible.builtin.file:
+    path: "{{ storage_dir }}/{{ current_node_name }}-system-disk"
+    state: absent
+  failed_when: false

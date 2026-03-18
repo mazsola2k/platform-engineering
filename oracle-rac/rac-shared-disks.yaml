@@ -1,0 +1,60 @@
+---
+# Create shared raw disk images for Oracle ASM.
+# These are host-local files mounted into RAC VMs via KubeVirt hostDisk with shared: true.
+# Three disk groups: DATA, FRA (Fast Recovery Area), VOTE (voting disks + OCR).
+
+- name: Ensure shared disk directory exists
+  ansible.builtin.file:
+    path: "{{ rac_shared_disk_path }}"
+    state: directory
+    mode: '0777'
+  become: true
+
+- name: Define ASM disk images
+  ansible.builtin.set_fact:
+    rac_asm_disks:
+      - name: asm-data.img
+        size: "{{ rac_asm_data_size }}"
+        purpose: "ASM DATA disk group"
+      - name: asm-fra.img
+        size: "{{ rac_asm_fra_size }}"
+        purpose: "ASM FRA (Fast Recovery Area) disk group"
+      - name: asm-vote.img
+        size: "{{ rac_asm_vote_size }}"
+        purpose: "ASM VOTE disk group (voting disks + OCR)"
+
+- name: Check if ASM disk images already exist
+  ansible.builtin.stat:
+    path: "{{ rac_shared_disk_path }}/{{ item.name }}"
+  register: asm_disk_check
+  loop: "{{ rac_asm_disks }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: Create ASM disk images (raw, zeroed)
+  ansible.builtin.command:
+    cmd: "qemu-img create -f raw {{ rac_shared_disk_path }}/{{ item.item.name }} {{ item.item.size }}"
+  loop: "{{ asm_disk_check.results }}"
+  loop_control:
+    label: "{{ item.item.name }}"
+  when: not item.stat.exists
+  become: true
+
+- name: Set ownership on ASM disk images
+  ansible.builtin.file:
+    path: "{{ rac_shared_disk_path }}/{{ item.name }}"
+    owner: qemu
+    group: qemu
+    mode: '0666'
+  loop: "{{ rac_asm_disks }}"
+  loop_control:
+    label: "{{ item.name }}"
+  become: true
+
+- name: Display ASM disk creation summary
+  ansible.builtin.debug:
+    msg:
+      - "✅ ASM shared disks created at {{ rac_shared_disk_path }}"
+      - "  asm-data.img  ({{ rac_asm_data_size }})  — DATA disk group"
+      - "  asm-fra.img   ({{ rac_asm_fra_size }})  — FRA disk group"
+      - "  asm-vote.img  ({{ rac_asm_vote_size }})  — VOTE disk group"

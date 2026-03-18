@@ -1,0 +1,56 @@
+---
+# Uninstall FSFO Observer VM and its storage.
+
+- name: "{{ rac_observer_name }} — Delete VirtualMachine"
+  kubernetes.core.k8s:
+    state: absent
+    api_version: kubevirt.io/v1
+    kind: VirtualMachine
+    name: "{{ rac_observer_name }}"
+    namespace: "{{ kubevirt_namespace }}"
+  failed_when: false
+
+- name: "{{ rac_observer_name }} — Wait for VM deletion"
+  kubernetes.core.k8s_info:
+    api_version: kubevirt.io/v1
+    kind: VirtualMachine
+    name: "{{ rac_observer_name }}"
+    namespace: "{{ kubevirt_namespace }}"
+  register: obs_del_check
+  until: obs_del_check.resources | length == 0
+  retries: 20
+  delay: 5
+  failed_when: false
+
+- name: "{{ rac_observer_name }} — Delete PVC"
+  kubernetes.core.k8s:
+    state: absent
+    api_version: v1
+    kind: PersistentVolumeClaim
+    name: "{{ rac_observer_name }}-system-disk"
+    namespace: "{{ kubevirt_namespace }}"
+  failed_when: false
+
+- name: "{{ rac_observer_name }} — Delete PV"
+  kubernetes.core.k8s:
+    state: absent
+    api_version: v1
+    kind: PersistentVolume
+    name: "{{ rac_observer_name }}-system-pv"
+  failed_when: false
+
+- name: "{{ rac_observer_name }} — Remove disk image"
+  ansible.builtin.file:
+    path: "{{ storage_dir }}/{{ rac_observer_name }}-system-disk/disk.img"
+    state: absent
+  failed_when: false
+
+- name: "{{ rac_observer_name }} — Remove hostPath directory"
+  ansible.builtin.file:
+    path: "{{ storage_dir }}/{{ rac_observer_name }}-system-disk"
+    state: absent
+  failed_when: false
+
+- name: Display observer cleanup status
+  ansible.builtin.debug:
+    msg: "✅ Observer VM {{ rac_observer_name }} removed"

@@ -18,7 +18,7 @@
   ansible.builtin.debug:
     msg:
       - "The required RHEL 9.6 qcow2 image is missing: {{ qcow2_image_path }}"
-      - "Please download it manually from: https://access.redhat.com/downloads/content/479/ver=/rhel---9/9.6/x86_64/product-software"
+      - "Please download it manually from: developer.redhat.com login and after from https://access.redhat.com/downloads/content/479/ver=/rhel---9/9.6/x86_64/product-software"
       - "Filename: rhel-9.6-x86_64-kvm.qcow2 (or override in CR)"
       - "Place the file at: {{ qcow2_image_path }} before running the installer."
   when: not qcow2_image_stat.stat.exists

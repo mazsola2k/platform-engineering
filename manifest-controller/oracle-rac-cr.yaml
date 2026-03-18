@@ -1,0 +1,43 @@
+apiVersion: infra.example.com/v1
+kind: OracleRAC
+metadata:
+  name: oracle-rac-demo
+  namespace: default
+spec:
+  # Topology C: 2 RAC nodes + 1 Data Guard standby + 1 FSFO observer = 4 VMs
+  rac_action: install
+  rac_nodes: 2
+  rac_dataguard: true
+  rac_fsfo: true
+  kubevirt_namespace: default
+  # VM sizing
+  rac_node_cpu: 4
+  rac_node_memory: "8Gi"
+  rac_node_disk: "40Gi"
+  rac_standby_cpu: 4
+  rac_standby_memory: "8Gi"
+  rac_standby_disk: "40Gi"
+  rac_observer_cpu: 1
+  rac_observer_memory: "1Gi"
+  rac_observer_disk: "10Gi"
+  # ASM shared disks (raw images on host via hostDisk)
+  rac_asm_data_size: "20G"
+  rac_asm_fra_size: "10G"
+  rac_asm_vote_size: "2G"
+  rac_shared_disk_path: "/var/lib/kubevirt/rac-shared"
+  # RAC private interconnect
+  rac_interconnect_subnet: "192.168.10.0/24"
+  rac_interconnect_bridge: "br-rac"
+  # Oracle configuration
+  rac_db_name: "RACDB"
+  rac_pdb_name: "RACPDB1"
+  rac_scan_name: "rac-scan"
+  rac_cluster_name: "rac-cluster"
+  rac_oracle_password: "Oracle123"
+  rac_vault_secret: "secret/data/oracle-rac/admin"
+  # Base OS image
+  qcow2_image_path: "./rhel-9.6-x86_64-kvm.qcow2"
+  storage_dir: "/data/vms"
+  # Red Hat subscription (override with your credentials)
+  subscription_username: "XXXXX"
+  subscription_password: "XXXXX"

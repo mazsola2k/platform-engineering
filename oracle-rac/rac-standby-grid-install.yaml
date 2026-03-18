@@ -1,0 +1,285 @@
+---
+# Install Oracle Grid Infrastructure 26ai (HA_CONFIG / Oracle Restart + ASM) on the standby VM.
+# Mirrors the primary's Grid setup so the standby uses ASM disk groups (DATA, FRA)
+# identical to the primary, enabling standard RMAN DUPLICATE without path overrides.
+
+- name: Define standby Grid home paths
+  ansible.builtin.set_fact:
+    _stby_grid_home: /u01/app/26ai/grid
+    _stby_grid_base: /u01/app/grid
+
+# ---- Wait for cloud-init + ensure groups exist ----
+- name: Wait for cloud-init to complete on standby (Grid pre-req)
+  delegate_to: "{{ rac_standby_name }}"
+  ansible.builtin.shell: cloud-init status --wait 2>&1 || true
+  timeout: 600
+  changed_when: false
+
+- name: Ensure grid user and ASM groups exist on standby
+  delegate_to: "{{ rac_standby_name }}"
+  ansible.builtin.shell: |
+    groupadd -g 54321 oinstall 2>/dev/null || true
+    groupadd -g 54322 dba 2>/dev/null || true
+    groupadd -g 54327 asmdba 2>/dev/null || true
+    groupadd -g 54328 asmoper 2>/dev/null || true
+    groupadd -g 54329 asmadmin 2>/dev/null || true
+    useradd -u 54331 -g oinstall -G dba,asmadmin,asmdba,asmoper grid 2>/dev/null || \
+      usermod -g oinstall -G dba,asmadmin,asmdba,asmoper grid
+    mkdir -p /u01/app/grid /u01/app/26ai/grid /u01/app/oraInventory
+    chown -R grid:oinstall /u01/app/grid /u01/app/26ai/grid /u01/app/oraInventory
+    chmod -R 775 /u01
+    id grid
+
+# ---- Check if Grid is already installed ----
+- name: Check if Grid Infrastructure is already installed on standby
+  delegate_to: "{{ rac_standby_name }}"
+  ansible.builtin.stat:
+    path: /u01/app/26ai/grid/bin/crsctl
+  register: stby_gi_installed_check
+
+# ---- Configure ASM devices ----
+- name: Configure ASM disk permissions on standby
+  delegate_to: "{{ rac_standby_name }}"
+  ansible.builtin.shell: |
+    mkdir -p /dev/oracleasm
+    for dev in /dev/vdb /dev/vdc /dev/vdd /dev/vde /dev/vdf; do
+      [ -b "$dev" ] || continue
+      serial=$(udevadm info --query=property --name="$dev" 2>/dev/null | sed -n 's/^ID_SERIAL=//p' || true)
+      case "$serial" in
+        ASM_DATA_STBY) ln -sf "$dev" /dev/oracleasm/asm-data ;;
+        ASM_FRA_STBY)  ln -sf "$dev" /dev/oracleasm/asm-fra  ;;
+      esac
+    done
+    if [ ! -L /dev/oracleasm/asm-data ]; then
+      [ -b /dev/vdc ] && ln -sf /dev/vdc /dev/oracleasm/asm-data
+      [ -b /dev/vdd ] && ln -sf /dev/vdd /dev/oracleasm/asm-fra
+    fi
+    chown grid:asmdba /dev/oracleasm/*
+    chmod 660 /dev/oracleasm/*
+    # Also fix the raw block devices (udev GROUP can be unreliable)
+    for link in /dev/oracleasm/*; do
+      [ -L "$link" ] && chown grid:asmdba "$(readlink -f $link)" && chmod 660 "$(readlink -f $link)"
+    done
+  args:
+    creates: /dev/oracleasm/asm-data
+  when: not stby_gi_installed_check.stat.exists
+
+- name: Create udev rules for persistent ASM device names on standby
+  delegate_to: "{{ rac_standby_name }}"
+  ansible.builtin.copy:
+    dest: /etc/udev/rules.d/99-oracle-asm.rules
+    content: |
+      # Oracle ASM disk rules — match by serial from KubeVirt hostDisk
+      ENV{ID_SERIAL}=="ASM_DATA_STBY", SYMLINK+="oracleasm/asm-data", OWNER="grid", GROUP="asmdba", MODE="0660"
+      ENV{ID_SERIAL}=="ASM_FRA_STBY",  SYMLINK+="oracleasm/asm-fra",  OWNER="grid", GROUP="asmdba", MODE="0660"
+    mode: '0644'
+  when: not stby_gi_installed_check.stat.exists
+
+- name: Reload udev on standby
+  delegate_to: "{{ rac_standby_name }}"
+  ansible.builtin.command: udevadm trigger
+  changed_when: false
+  when: not stby_gi_installed_check.stat.exists
+
+# ---- Copy and extract Grid Infrastructure ----
+- name: Copy Grid Infrastructure ZIP to standby
+  delegate_to: "{{ rac_standby_name }}"
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/LINUX.X64_2326100_grid_home.zip"
+    dest: /tmp/LINUX.X64_2326100_grid_home.zip
+    mode: '0644'
+  when: not stby_gi_installed_check.stat.exists
+
+- name: Extract Grid Infrastructure to GRID_HOME on standby
+  delegate_to: "{{ rac_standby_name }}"
+  become: true
+  become_user: grid
+  ansible.builtin.shell: |
+    cd /u01/app/26ai/grid
+    unzip -oq /tmp/LINUX.X64_2326100_grid_home.zip
+  when: not stby_gi_installed_check.stat.exists
+
+# ---- Run gridSetup.sh in silent mode ----
+- name: Build Grid Infrastructure response file on standby
+  delegate_to: "{{ rac_standby_name }}"
+  ansible.builtin.copy:
+    dest: /tmp/grid_install.rsp
+    owner: grid
+    group: oinstall
+    mode: '0644'
+    content: |
+      oracle.install.responseFileVersion=/oracle/install/rspfmt_crsinstall_response_schema_v23.0.0
+      INVENTORY_LOCATION=/u01/app/oraInventory
+      installOption=HA_CONFIG
+      ORACLE_BASE=/u01/app/grid
+      OSDBA=asmdba
+      OSOPER=asmoper
+      OSASM=asmadmin
+      storageOption=FLEX_ASM_STORAGE
+      sysasmPassword={{ rac_oracle_password }}
+      diskGroupName=DATA
+      redundancy=EXTERNAL
+      auSize=4
+      diskList=/dev/oracleasm/asm-data
+      diskString=/dev/oracleasm/*
+      asmsnmpPassword={{ rac_oracle_password }}
+      executeRootScript=false
+      enableAutoFixup=false
+  when: not stby_gi_installed_check.stat.exists
+
+- name: Run gridSetup.sh on standby (silent install)
+  delegate_to: "{{ rac_standby_name }}"
+  become: true
+  become_user: grid
+  ansible.builtin.shell: |
+    /u01/app/26ai/grid/gridSetup.sh -silent -responseFile /tmp/grid_install.rsp \
+      -ignorePrereqFailure 2>&1 | tee /tmp/gridSetup_standby.log
+    exit_code=$?
+    if [ $exit_code -eq 0 ] || [ $exit_code -eq 6 ]; then
+      exit 0
+    else
+      exit $exit_code
+    fi
+  register: stby_gi_setup_result
+  when: not stby_gi_installed_check.stat.exists
+  async: 1800
+  poll: 30
+
+# ---- Run root.sh ----
+- name: Run orainstRoot.sh on standby
+  delegate_to: "{{ rac_standby_name }}"
+  ansible.builtin.command: /u01/app/oraInventory/orainstRoot.sh
+  when: not stby_gi_installed_check.stat.exists
+  failed_when: false
+
+- name: Run root.sh on standby
+  delegate_to: "{{ rac_standby_name }}"
+  ansible.builtin.shell: |
+    /u01/app/26ai/grid/root.sh 2>&1 | tee /tmp/root_sh_standby.log
+  when: not stby_gi_installed_check.stat.exists
+  async: 600
+  poll: 15
+  failed_when: false
+
+# ---- Post-root.sh fixups (same ACFS recovery as primary) ----
+- name: Check if CSS is online on standby
+  delegate_to: "{{ rac_standby_name }}"
+  ansible.builtin.shell: |
+    /u01/app/26ai/grid/bin/crsctl check css 2>/dev/null | grep -q "online" && echo "ONLINE" || echo "OFFLINE"
+  register: stby_css_check
+  changed_when: false
+  failed_when: false
+
+- name: Fix Grid home oracle binary permissions on standby (setuid/setgid)
+  delegate_to: "{{ rac_standby_name }}"
+  ansible.builtin.file:
+    path: /u01/app/26ai/grid/bin/oracle
+    owner: grid
+    group: oinstall
+    mode: '6751'
+  when: stby_css_check.stdout | default('') == 'OFFLINE'
+  failed_when: false
+
+- name: Fix hostname resolution on standby (L2 IP)
+  delegate_to: "{{ rac_standby_name }}"
+  ansible.builtin.lineinfile:
+    path: /etc/hosts
+    regexp: '\s{{ rac_standby_name }}(\s|$)'
+    line: "{{ rac_standby_priv_ip }} {{ rac_standby_name }}"
+    state: present
+
+- name: Fix ocr.loc permissions on standby
+  delegate_to: "{{ rac_standby_name }}"
+  ansible.builtin.file:
+    path: /etc/oracle/ocr.loc
+    mode: '0644'
+  failed_when: false
+
+- name: Complete HAS configuration on standby after ACFS failure
+  delegate_to: "{{ rac_standby_name }}"
+  ansible.builtin.shell: |
+    export ORACLE_HOME=/u01/app/26ai/grid
+    export PATH=$ORACLE_HOME/bin:$PATH
+    if crsctl check css 2>/dev/null | grep -q "online"; then
+      echo "CSS already online"
+      exit 0
+    fi
+    su - grid -c "$ORACLE_HOME/gridSetup.sh -silent -executeConfigTools \
+      -responseFile /tmp/grid_install.rsp 2>&1" | tee /tmp/configTools_standby.log || true
+    sleep 5
+    if crsctl check css 2>/dev/null | grep -q "online"; then
+      echo "CSS is now online"
+      exit 0
+    fi
+    crsctl start has 2>&1 || true
+    for i in $(seq 1 30); do
+      if crsctl check css 2>/dev/null | grep -q "online"; then
+        echo "CSS online after manual start"
+        exit 0
+      fi
+      sleep 2
+    done
+    echo "ERROR: CSS did not come online"
+    crsctl stat res -t 2>&1
+    exit 1
+  when: stby_css_check.stdout | default('') == 'OFFLINE'
+  async: 600
+  poll: 15
+
+- name: Wait for ASM to come online on standby
+  delegate_to: "{{ rac_standby_name }}"
+  ansible.builtin.shell: |
+    export ORACLE_HOME=/u01/app/26ai/grid
+    export PATH=$ORACLE_HOME/bin:$PATH
+    for i in $(seq 1 30); do
+      if crsctl stat res ora.asm -t 2>/dev/null | grep -q "ONLINE"; then
+        echo "ASM is ONLINE"
+        exit 0
+      fi
+      sleep 2
+    done
+    echo "ASM did not come online"
+    crsctl stat res -t 2>&1
+    exit 1
+  register: stby_asm_online_check
+
+# ---- Create FRA disk group ----
+- name: Create FRA disk group on standby via ASMCA
+  delegate_to: "{{ rac_standby_name }}"
+  become: true
+  become_user: grid
+  ansible.builtin.shell: |
+    export ORACLE_HOME=/u01/app/26ai/grid
+    export ORACLE_BASE=/u01/app/grid
+    export PATH=$ORACLE_HOME/bin:$PATH
+
+    # Skip if FRA already exists
+    if ORACLE_SID=+ASM asmcmd lsdg 2>/dev/null | grep -q FRA; then
+      echo "FRA disk group already exists"
+      exit 0
+    fi
+
+    asmca -silent -createDiskGroup \
+      -diskGroupName FRA \
+      -diskList '/dev/oracleasm/asm-fra' \
+      -redundancy EXTERNAL \
+      -au_size 4 \
+      -compatible.asm '23.0.0.0.0' 2>&1 || true
+  register: stby_asm_fra_result
+
+# ---- Verify ----
+- name: Verify Grid Infrastructure status on standby
+  delegate_to: "{{ rac_standby_name }}"
+  ansible.builtin.shell: |
+    export ORACLE_HOME=/u01/app/26ai/grid
+    export PATH=$ORACLE_HOME/bin:$PATH
+    crsctl stat res -t 2>&1 | head -60
+  register: stby_crs_status
+  changed_when: false
+  failed_when: false
+
+- name: Display standby Grid Infrastructure status
+  ansible.builtin.debug:
+    msg:
+      - "✅ Grid Infrastructure installation complete on standby"
+      - "{{ stby_crs_status.stdout_lines | default(['Status not available']) }}"

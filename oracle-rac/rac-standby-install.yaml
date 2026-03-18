@@ -1,0 +1,844 @@
+---
+# Provision standby VM with Grid Infrastructure + ASM and create a physical
+# standby database via RMAN DUPLICATE.  The standby mirrors the primary's
+# storage stack (ASM disk groups DATA, FRA) so no path overrides are needed.
+
+# ---- Infrastructure helpers ----
+- name: Get node hostname for PV affinity
+  ansible.builtin.shell: kubectl get nodes -o jsonpath='{.items[0].metadata.name}'
+  register: node_hostname
+  changed_when: false
+
+- name: Compute absolute storage directory
+  ansible.builtin.set_fact:
+    storage_abs_dir: "{{ storage_dir }}"
+
+# ---- Create standby ASM disk images (separate from primary) ----
+- name: "{{ rac_standby_name }} — Ensure standby ASM disk directory"
+  ansible.builtin.file:
+    path: "{{ rac_shared_disk_path }}/standby"
+    state: directory
+    mode: '0777'
+  become: true
+
+- name: "{{ rac_standby_name }} — Check standby ASM disk images"
+  ansible.builtin.stat:
+    path: "{{ rac_shared_disk_path }}/standby/{{ item.name }}"
+  register: stby_asm_disk_check
+  loop:
+    - { name: "asm-data-stby.img", size: "{{ rac_asm_data_size }}" }
+    - { name: "asm-fra-stby.img",  size: "{{ rac_asm_fra_size }}" }
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: "{{ rac_standby_name }} — Create standby ASM disk images"
+  ansible.builtin.command:
+    cmd: "qemu-img create -f raw {{ rac_shared_disk_path }}/standby/{{ item.item.name }} {{ item.item.size }}"
+  loop: "{{ stby_asm_disk_check.results }}"
+  loop_control:
+    label: "{{ item.item.name }}"
+  when: not item.stat.exists
+  become: true
+
+- name: "{{ rac_standby_name }} — Set ownership on standby ASM disks"
+  ansible.builtin.file:
+    path: "{{ rac_shared_disk_path }}/standby/{{ item }}"
+    owner: qemu
+    group: qemu
+    mode: '0666'
+  loop:
+    - asm-data-stby.img
+    - asm-fra-stby.img
+  become: true
+
+# ---- PV ----
+- name: "{{ rac_standby_name }} — Check for existing PV"
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: PersistentVolume
+    name: "{{ rac_standby_name }}-system-pv"
+  register: stby_pv_check
+  failed_when: false
+
+- name: "{{ rac_standby_name }} — Create PersistentVolume"
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: PersistentVolume
+      metadata:
+        name: "{{ rac_standby_name }}-system-pv"
+        labels:
+          type: local
+          app: "{{ rac_standby_name }}"
+      spec:
+        capacity:
+          storage: "{{ rac_standby_disk }}"
+        accessModes: ["ReadWriteOnce"]
+        persistentVolumeReclaimPolicy: Retain
+        storageClassName: local-storage
+        volumeMode: Filesystem
+        hostPath:
+          path: "{{ storage_abs_dir }}/{{ rac_standby_name }}-system-disk"
+          type: DirectoryOrCreate
+        nodeAffinity:
+          required:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: In
+                    values: ["{{ node_hostname.stdout }}"]
+  when: stby_pv_check.resources | length == 0
+
+# ---- PVC ----
+- name: "{{ rac_standby_name }} — Check for existing PVC"
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: PersistentVolumeClaim
+    name: "{{ rac_standby_name }}-system-disk"
+    namespace: "{{ kubevirt_namespace }}"
+  register: stby_pvc_check
+  failed_when: false
+
+- name: "{{ rac_standby_name }} — Create PersistentVolumeClaim"
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata:
+        name: "{{ rac_standby_name }}-system-disk"
+        namespace: "{{ kubevirt_namespace }}"
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: "{{ rac_standby_disk }}"
+        storageClassName: local-storage
+        volumeMode: Filesystem
+        volumeName: "{{ rac_standby_name }}-system-pv"
+  when: stby_pvc_check.resources | length == 0
+
+# ---- Disk preparation ----
+- name: "{{ rac_standby_name }} — Ensure PV directory exists"
+  ansible.builtin.file:
+    path: "{{ storage_abs_dir }}/{{ rac_standby_name }}-system-disk"
+    state: directory
+    mode: '0777'
+  become: true
+
+- name: "{{ rac_standby_name }} — Check if disk.img exists"
+  ansible.builtin.stat:
+    path: "{{ storage_abs_dir }}/{{ rac_standby_name }}-system-disk/disk.img"
+  register: stby_disk_check
+
+- name: "{{ rac_standby_name }} — Convert qcow2 to raw"
+  ansible.builtin.command:
+    cmd: "qemu-img convert -f qcow2 -O raw '{{ qcow2_image_path }}' '{{ storage_abs_dir }}/{{ rac_standby_name }}-system-disk/disk.img'"
+  when: not stby_disk_check.stat.exists
+  become: true
+
+- name: "{{ rac_standby_name }} — Resize raw disk"
+  ansible.builtin.command:
+    cmd: "qemu-img resize '{{ storage_abs_dir }}/{{ rac_standby_name }}-system-disk/disk.img' {{ rac_standby_disk | regex_replace('Gi$', 'G') }}"
+  when: not stby_disk_check.stat.exists
+  become: true
+
+- name: "{{ rac_standby_name }} — Set ownership on disk.img"
+  ansible.builtin.file:
+    path: "{{ storage_abs_dir }}/{{ rac_standby_name }}-system-disk/disk.img"
+    owner: qemu
+    group: qemu
+    mode: '0644'
+  become: true
+
+# ---- Cloud-init Secret (grid user + ASM groups for Grid Infrastructure) ----
+- name: "{{ rac_standby_name }} — Create cloud-init Secret"
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: "{{ rac_standby_name }}-cloudinit"
+        namespace: "{{ kubevirt_namespace }}"
+      type: Opaque
+      stringData:
+        userdata: |
+          #cloud-config
+          hostname: {{ rac_standby_name }}
+          disable_root: false
+          ssh_pwauth: true
+          users:
+            - name: oracle
+              sudo: ALL=(ALL) NOPASSWD:ALL
+              lock_passwd: false
+            - name: grid
+              sudo: ALL=(ALL) NOPASSWD:ALL
+              lock_passwd: false
+          chpasswd:
+            list: |
+              root:{{ rac_oracle_password }}
+              oracle:{{ rac_oracle_password }}
+              grid:{{ rac_oracle_password }}
+            expire: False
+          write_files:
+            - path: /etc/ssh/sshd_config.d/99-cloud-init.conf
+              content: |
+                PermitRootLogin yes
+                PasswordAuthentication yes
+                ChallengeResponseAuthentication no
+                UsePAM yes
+            - path: /etc/hosts.rac
+              content: |
+                # RAC L2 interconnect
+                {{ rac_node1_priv_ip }}  rac-node1 rac-node1-priv rac-primary
+                {{ rac_node2_priv_ip }}  rac-node2 rac-node2-priv
+                {{ rac_standby_priv_ip }}  rac-standby
+                {{ rac_scan_ip }}        {{ rac_scan_name }}
+            - path: /etc/sysctl.d/98-oracle-rac.conf
+              content: |
+                kernel.shmmax = 4398046511104
+                kernel.shmall = 1073741824
+                kernel.shmmni = 4096
+                kernel.sem = 250 32000 100 128
+                net.ipv4.ip_local_port_range = 9000 65500
+                net.core.rmem_default = 262144
+                net.core.rmem_max = 4194304
+                net.core.wmem_default = 262144
+                net.core.wmem_max = 1048576
+                fs.aio-max-nr = 1048576
+                fs.file-max = 6815744
+                vm.hugetlb_shm_group = 54321
+            - path: /etc/security/limits.d/98-oracle.conf
+              content: |
+                oracle soft nproc 2047
+                oracle hard nproc 16384
+                oracle soft nofile 1024
+                oracle hard nofile 65536
+                oracle soft stack 10240
+                oracle hard stack 32768
+                oracle soft memlock unlimited
+                oracle hard memlock unlimited
+                grid soft nproc 2047
+                grid hard nproc 16384
+                grid soft nofile 1024
+                grid hard nofile 65536
+                grid soft stack 10240
+                grid hard stack 32768
+                grid soft memlock unlimited
+                grid hard memlock unlimited
+          runcmd:
+            - growpart /dev/vda 1
+            - resize2fs /dev/vda1 || xfs_growfs /
+            - sysctl --system
+            - systemctl reload sshd
+            - cat /etc/hosts.rac >> /etc/hosts
+            - |
+              subscription-manager register \
+                --username="{{ subscription_username }}" \
+                --password="{{ subscription_password }}" \
+                --auto-attach 2>&1 || true
+            - subscription-manager repos --enable=rhel-9-for-x86_64-baseos-rpms --enable=rhel-9-for-x86_64-appstream-rpms 2>&1 || true
+            - dnf install -y bc binutils elfutils-libelf ksh libaio libaio-devel make sysstat unzip tar glibc-devel gcc gcc-c++ glibc-langpack-en net-tools smartmontools 2>&1 || true
+            - groupadd -g 54321 oinstall 2>/dev/null || true
+            - groupadd -g 54322 dba 2>/dev/null || true
+            - groupadd -g 54323 oper 2>/dev/null || true
+            - groupadd -g 54324 backupdba 2>/dev/null || true
+            - groupadd -g 54325 dgdba 2>/dev/null || true
+            - groupadd -g 54326 kmdba 2>/dev/null || true
+            - groupadd -g 54327 asmdba 2>/dev/null || true
+            - groupadd -g 54328 asmoper 2>/dev/null || true
+            - groupadd -g 54329 asmadmin 2>/dev/null || true
+            - useradd -u 1000 -g oinstall -G dba,oper,backupdba,dgdba,kmdba,asmdba oracle 2>/dev/null || usermod -g oinstall -G dba,oper,backupdba,dgdba,kmdba,asmdba oracle 2>/dev/null || true
+            - useradd -u 54331 -g oinstall -G dba,asmadmin,asmdba,asmoper grid 2>/dev/null || usermod -g oinstall -G dba,asmadmin,asmdba,asmoper grid
+            - mkdir -p /u01/app/grid /u01/app/26ai/grid /u01/app/oracle/product/26ai/dbhome_1 /u01/app/oracle/admin /u01/app/oraInventory
+            - chown -R grid:oinstall /u01/app/grid /u01/app/26ai/grid /u01/app/oraInventory
+            - chown -R oracle:oinstall /u01/app/oracle
+            - chmod -R 775 /u01
+            - echo "cloud-init standby setup complete" | tee /var/log/cloudinit-standby.log
+            - |
+              # Configure L2 interconnect on second NIC
+              for attempt in $(seq 1 60); do
+                DEFAULT_IF=$(ip route show default 2>/dev/null | awk '{print $5}' | head -1)
+                for iface in $(ls /sys/class/net/ | grep -v '^lo$' | sort); do
+                  [ "$iface" = "$DEFAULT_IF" ] && continue
+                  nmcli con add type ethernet ifname "$iface" con-name l2-interconnect ip4 {{ rac_standby_priv_ip }}/24 2>/dev/null
+                  nmcli con up l2-interconnect 2>/dev/null
+                  echo "L2 interconnect configured on $iface with IP {{ rac_standby_priv_ip }}" | tee -a /var/log/cloudinit-standby.log
+                  exit 0
+                done
+                sleep 1
+              done
+              echo "WARNING: Could not find second NIC for L2 interconnect" | tee -a /var/log/cloudinit-standby.log
+
+# ---- Create VM with ASM disks attached ----
+- name: "{{ rac_standby_name }} — Create VirtualMachine"
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: kubevirt.io/v1
+      kind: VirtualMachine
+      metadata:
+        name: "{{ rac_standby_name }}"
+        namespace: "{{ kubevirt_namespace }}"
+        labels:
+          app: oracle-rac
+          role: standby
+      spec:
+        running: true
+        template:
+          metadata:
+            labels:
+              kubevirt.io/domain: "{{ rac_standby_name }}"
+              app: oracle-rac
+          spec:
+            domain:
+              cpu:
+                cores: "{{ rac_standby_cpu | int }}"
+              devices:
+                disks:
+                  - name: rootdisk
+                    disk:
+                      bus: virtio
+                  - name: cloudinitdisk
+                    disk:
+                      bus: virtio
+                  - name: asm-data
+                    disk:
+                      bus: virtio
+                    serial: ASM_DATA_STBY
+                  - name: asm-fra
+                    disk:
+                      bus: virtio
+                    serial: ASM_FRA_STBY
+                interfaces:
+                  - name: default
+                    masquerade: {}
+                  - name: l2net
+                    bridge: {}
+              resources:
+                requests:
+                  memory: "{{ rac_standby_memory }}"
+            networks:
+              - name: default
+                pod: {}
+              - name: l2net
+                multus:
+                  networkName: rac-interconnect
+            volumes:
+              - name: rootdisk
+                persistentVolumeClaim:
+                  claimName: "{{ rac_standby_name }}-system-disk"
+              - name: cloudinitdisk
+                cloudInitNoCloud:
+                  secretRef:
+                    name: "{{ rac_standby_name }}-cloudinit"
+              - name: asm-data
+                hostDisk:
+                  path: "{{ rac_shared_disk_path }}/standby/asm-data-stby.img"
+                  type: Disk
+              - name: asm-fra
+                hostDisk:
+                  path: "{{ rac_shared_disk_path }}/standby/asm-fra-stby.img"
+                  type: Disk
+
+# ---- Wait for standby VM ----
+- name: "{{ rac_standby_name }} — Wait for VM to be Running"
+  kubernetes.core.k8s_info:
+    api_version: kubevirt.io/v1
+    kind: VirtualMachine
+    name: "{{ rac_standby_name }}"
+    namespace: "{{ kubevirt_namespace }}"
+  register: stby_vm_status
+  until: >-
+    stby_vm_status.resources | length > 0 and
+    stby_vm_status.resources[0].status.printableStatus | default('') == 'Running'
+  retries: 40
+  delay: 10
+
+- name: "{{ rac_standby_name }} — Set L2 static IPs"
+  ansible.builtin.set_fact:
+    rac_standby_ip: "{{ rac_standby_priv_ip }}"
+    rac_primary_ip: "{{ rac_node1_priv_ip }}"
+
+- name: Add standby to inventory (L2 IP)
+  ansible.builtin.add_host:
+    name: "{{ rac_standby_name }}"
+    ansible_host: "{{ rac_standby_ip }}"
+    ansible_user: "oracle"
+    ansible_password: "{{ rac_oracle_password }}"
+    ansible_become: true
+    ansible_become_method: sudo
+    ansible_ssh_common_args: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+
+- name: Wait for SSH on standby (L2 — cloud-init must configure NIC first)
+  ansible.builtin.wait_for:
+    host: "{{ rac_standby_ip }}"
+    port: 22
+    timeout: 600
+    delay: 30
+
+# ==================================================================
+# Grid Infrastructure + ASM on standby (mirrors primary's setup)
+# ==================================================================
+- name: Install Grid Infrastructure on standby
+  ansible.builtin.include_tasks: rac-standby-grid-install.yaml
+
+# ==================================================================
+# Oracle DB software on standby (software only — no DB creation)
+# ==================================================================
+- name: Wait for cloud-init to finish on standby
+  delegate_to: "{{ rac_standby_name }}"
+  ansible.builtin.shell: cloud-init status --wait 2>&1 || true
+  register: cloud_init_wait
+  timeout: 600
+  changed_when: false
+
+- name: Register RHEL subscription on standby
+  delegate_to: "{{ rac_standby_name }}"
+  ansible.builtin.shell: |
+    if subscription-manager identity &>/dev/null; then
+      echo 'Already registered'
+    else
+      subscription-manager register \
+        --username="{{ subscription_username }}" \
+        --password="{{ subscription_password }}" \
+        --auto-attach 2>&1 || true
+      subscription-manager repos \
+        --enable=rhel-9-for-x86_64-baseos-rpms \
+        --enable=rhel-9-for-x86_64-appstream-rpms 2>&1 || true
+    fi
+  when: subscription_username != 'XXXXX'
+
+- name: Install Oracle prerequisites on standby
+  delegate_to: "{{ rac_standby_name }}"
+  ansible.builtin.dnf:
+    name:
+      - unzip
+      - libaio
+      - libaio-devel
+      - bc
+      - binutils
+      - elfutils-libelf
+      - ksh
+      - make
+      - sysstat
+      - tar
+      - net-tools
+      - smartmontools
+      - glibc-devel
+      - gcc
+      - gcc-c++
+      - glibc-langpack-en
+    state: present
+
+- name: Check if Oracle DB software is properly installed on standby
+  delegate_to: "{{ rac_standby_name }}"
+  ansible.builtin.shell: |
+    ORACLE_BIN=/u01/app/oracle/product/26ai/dbhome_1/bin/oracle
+    if [ -f "$ORACLE_BIN" ] && [ -s "$ORACLE_BIN" ] && [ -x "$ORACLE_BIN" ]; then
+      echo "INSTALLED"
+    else
+      echo "NOT_INSTALLED"
+    fi
+  register: stby_oracle_home_check_raw
+  changed_when: false
+
+- name: Set standby DB home installed fact
+  ansible.builtin.set_fact:
+    stby_db_installed: "{{ stby_oracle_home_check_raw.stdout | trim == 'INSTALLED' }}"
+
+- name: Ensure oracle and grid user groups on standby
+  delegate_to: "{{ rac_standby_name }}"
+  ansible.builtin.shell: |
+    groupadd -g 54321 oinstall 2>/dev/null || true
+    groupadd -g 54322 dba 2>/dev/null || true
+    groupadd -g 54323 oper 2>/dev/null || true
+    groupadd -g 54324 backupdba 2>/dev/null || true
+    groupadd -g 54325 dgdba 2>/dev/null || true
+    groupadd -g 54326 kmdba 2>/dev/null || true
+    groupadd -g 54327 asmdba 2>/dev/null || true
+    groupadd -g 54328 asmoper 2>/dev/null || true
+    groupadd -g 54329 asmadmin 2>/dev/null || true
+    usermod -g oinstall -G dba,oper,backupdba,dgdba,kmdba,asmdba oracle
+    useradd -u 54331 -g oinstall -G dba,asmadmin,asmdba,asmoper grid 2>/dev/null || \
+      usermod -g oinstall -G dba,asmadmin,asmdba,asmoper grid
+    chown -R oracle:oinstall /u01/app/oracle /u01/app/oraInventory 2>/dev/null || true
+    chown -R grid:oinstall /u01/app/grid /u01/app/26ai/grid 2>/dev/null || true
+    # Create oraInst.loc if missing
+    if [ ! -f /etc/oraInst.loc ]; then
+      echo "inventory_loc=/u01/app/oraInventory" > /etc/oraInst.loc
+      echo "inst_group=oinstall" >> /etc/oraInst.loc
+    fi
+    id oracle; id grid
+  changed_when: true
+
+- name: Copy Oracle DB ZIP to standby
+  delegate_to: "{{ rac_standby_name }}"
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/LINUX.X64_2326100_db_home.zip"
+    dest: /tmp/LINUX.X64_2326100_db_home.zip
+    mode: '0644'
+  when: not stby_db_installed
+
+- name: Install Oracle DB software on standby
+  delegate_to: "{{ rac_standby_name }}"
+  become: true
+  become_user: oracle
+  ansible.builtin.shell: |
+    set -o pipefail
+    mkdir -p /u01/app/oracle/product/26ai/dbhome_1
+    cd /u01/app/oracle/product/26ai/dbhome_1
+    unzip -oq /tmp/LINUX.X64_2326100_db_home.zip
+    ./runInstaller -silent -ignorePrereqFailure \
+      -responseFile /u01/app/oracle/product/26ai/dbhome_1/install/response/db_install.rsp \
+      oracle.install.option=INSTALL_DB_SWONLY \
+      ORACLE_HOME=/u01/app/oracle/product/26ai/dbhome_1 \
+      ORACLE_BASE=/u01/app/oracle \
+      oracle.install.db.InstallEdition=EE \
+      oracle.install.db.OSDBA_GROUP=dba \
+      oracle.install.db.OSOPER_GROUP=oper \
+      oracle.install.db.OSBACKUPDBA_GROUP=backupdba \
+      oracle.install.db.OSDGDBA_GROUP=dgdba \
+      oracle.install.db.OSKMDBA_GROUP=kmdba \
+      oracle.install.db.OSRACDBA_GROUP=dba \
+      SECURITY_UPDATES_VIA_MYORACLESUPPORT=false \
+      DECLINE_SECURITY_UPDATES=true 2>&1 | tee /tmp/db_sw_install_standby.log
+    exit_code=${PIPESTATUS[0]}
+    if [ $exit_code -eq 0 ] || [ $exit_code -eq 6 ]; then exit 0; else exit $exit_code; fi
+  register: stby_sw_install
+  when: not stby_db_installed
+  async: 1800
+  poll: 30
+
+- name: Run root.sh for Oracle DB home on standby
+  delegate_to: "{{ rac_standby_name }}"
+  ansible.builtin.shell: |
+    [ -f /u01/app/oracle/product/26ai/dbhome_1/root.sh ] && /u01/app/oracle/product/26ai/dbhome_1/root.sh || true
+  when: not stby_db_installed
+  failed_when: false
+
+- name: Fix oracle binary permissions on standby (setuid/setgid for listener handoff)
+  delegate_to: "{{ rac_standby_name }}"
+  ansible.builtin.file:
+    path: /u01/app/oracle/product/26ai/dbhome_1/bin/oracle
+    owner: oracle
+    group: asmdba
+    mode: '6751'
+
+# ---- Post-DB-software fixups ----
+- name: Create symlink for hardcoded DBCA home path on standby
+  delegate_to: "{{ rac_standby_name }}"
+  ansible.builtin.shell: |
+    HARDCODED=$(grep '^OH=' /u01/app/oracle/product/26ai/dbhome_1/bin/dbca | head -1 | cut -d= -f2)
+    ACTUAL=/u01/app/oracle/product/26ai/dbhome_1
+    if [ "$HARDCODED" != "$ACTUAL" ] && [ ! -e "$HARDCODED" ]; then
+      mkdir -p "$(dirname "$HARDCODED")"
+      ln -sf "$ACTUAL" "$HARDCODED"
+      echo "Created symlink $HARDCODED -> $ACTUAL"
+    else
+      echo "No symlink needed"
+    fi
+  changed_when: false
+
+- name: Copy getcrshome from Grid to DB home on standby
+  delegate_to: "{{ rac_standby_name }}"
+  ansible.builtin.shell: |
+    SRC=/u01/app/26ai/grid/srvm/admin/getcrshome
+    DST=/u01/app/oracle/product/26ai/dbhome_1/srvm/admin/getcrshome
+    if [ -f "$SRC" ] && [ ! -f "$DST" ]; then
+      mkdir -p "$(dirname "$DST")"
+      cp "$SRC" "$DST"
+      chown oracle:oinstall "$DST"
+      chmod 755 "$DST"
+    fi
+  changed_when: false
+
+# ==================================================================
+# TNS configuration — L2 IPs used everywhere (no masquerade workarounds)
+# ==================================================================
+- name: Configure tnsnames.ora on primary for standby
+  delegate_to: "{{ rac_node_names[0] }}"
+  become: true
+  become_user: oracle
+  ansible.builtin.blockinfile:
+    path: /u01/app/oracle/product/26ai/dbhome_1/network/admin/tnsnames.ora
+    create: true
+    mode: '0644'
+    marker: "# {mark} ANSIBLE MANAGED - STANDBY TNS"
+    block: |
+      {{ rac_db_name }}_STDBY =
+        (DESCRIPTION =
+          (ADDRESS = (PROTOCOL = TCP)(HOST = {{ rac_standby_priv_ip }})(PORT = 1521))
+          (CONNECT_DATA =
+            (SERVER = DEDICATED)
+            (SERVICE_NAME = {{ rac_db_name }})
+          )
+        )
+
+      {{ rac_db_name }}_PRIMARY =
+        (DESCRIPTION =
+          (ADDRESS = (PROTOCOL = TCP)(HOST = {{ rac_node1_priv_ip }})(PORT = 1521))
+          (CONNECT_DATA =
+            (SERVER = DEDICATED)
+            (SERVICE_NAME = {{ rac_db_name }})
+          )
+        )
+
+- name: Configure tnsnames.ora on standby
+  delegate_to: "{{ rac_standby_name }}"
+  become: true
+  become_user: oracle
+  ansible.builtin.blockinfile:
+    path: /u01/app/oracle/product/26ai/dbhome_1/network/admin/tnsnames.ora
+    create: true
+    mode: '0644'
+    marker: "# {mark} ANSIBLE MANAGED - DG TNS"
+    block: |
+      {{ rac_db_name }}_STDBY =
+        (DESCRIPTION =
+          (ADDRESS = (PROTOCOL = TCP)(HOST = {{ rac_standby_priv_ip }})(PORT = 1521))
+          (CONNECT_DATA =
+            (SERVER = DEDICATED)
+            (SERVICE_NAME = {{ rac_db_name }})
+          )
+        )
+
+      {{ rac_db_name }}_PRIMARY =
+        (DESCRIPTION =
+          (ADDRESS = (PROTOCOL = TCP)(HOST = {{ rac_node1_priv_ip }})(PORT = 1521))
+          (CONNECT_DATA =
+            (SERVER = DEDICATED)
+            (SERVICE_NAME = {{ rac_db_name }})
+          )
+        )
+
+# ==================================================================
+# Listener on standby — runs from Grid home (grid user) with
+# static registration so RMAN can connect to the NOMOUNT instance.
+# Binds to L2 IP for direct connectivity.
+# ==================================================================
+- name: Configure static listener on standby (Grid home)
+  delegate_to: "{{ rac_standby_name }}"
+  become: true
+  become_user: grid
+  ansible.builtin.copy:
+    dest: /u01/app/26ai/grid/network/admin/listener.ora
+    mode: '0644'
+    content: |
+      LISTENER =
+        (DESCRIPTION_LIST =
+          (DESCRIPTION =
+            (ADDRESS = (PROTOCOL = TCP)(HOST = {{ rac_standby_priv_ip }})(PORT = 1521))
+          )
+        )
+
+      SID_LIST_LISTENER =
+        (SID_LIST =
+          (SID_DESC =
+            (GLOBAL_DBNAME = {{ rac_db_name }}_DGMGRL)
+            (ORACLE_HOME = /u01/app/oracle/product/26ai/dbhome_1)
+            (SID_NAME = {{ rac_db_name }})
+          )
+          (SID_DESC =
+            (GLOBAL_DBNAME = {{ rac_db_name }})
+            (ORACLE_HOME = /u01/app/oracle/product/26ai/dbhome_1)
+            (SID_NAME = {{ rac_db_name }})
+          )
+          (SID_DESC =
+            (GLOBAL_DBNAME = {{ rac_db_name }}_STDBY)
+            (ORACLE_HOME = /u01/app/oracle/product/26ai/dbhome_1)
+            (SID_NAME = {{ rac_db_name }})
+          )
+        )
+
+- name: Restart listener on standby (Grid home)
+  delegate_to: "{{ rac_standby_name }}"
+  become: true
+  become_user: grid
+  ansible.builtin.shell: |
+    export ORACLE_HOME=/u01/app/26ai/grid
+    export PATH=$ORACLE_HOME/bin:$PATH
+    lsnrctl stop  2>&1 || true
+    lsnrctl start 2>&1 || true
+  changed_when: false
+
+# ==================================================================
+# Password file (needed before RMAN connect)
+# ==================================================================
+- name: Fetch password file from primary
+  delegate_to: "{{ rac_node_names[0] }}"
+  become: true
+  become_user: oracle
+  ansible.builtin.fetch:
+    src: /u01/app/oracle/product/26ai/dbhome_1/dbs/orapw{{ rac_db_name }}
+    dest: "/tmp/orapw{{ rac_db_name }}"
+    flat: true
+
+- name: Copy password file to standby
+  delegate_to: "{{ rac_standby_name }}"
+  become: true
+  become_user: oracle
+  ansible.builtin.copy:
+    src: "/tmp/orapw{{ rac_db_name }}"
+    dest: /u01/app/oracle/product/26ai/dbhome_1/dbs/orapw{{ rac_db_name }}
+    mode: '0640'
+    owner: oracle
+    group: oinstall
+
+# ==================================================================
+# Start auxiliary instance in NOMOUNT for RMAN DUPLICATE
+# ==================================================================
+- name: Create init.ora on standby for RMAN auxiliary
+  delegate_to: "{{ rac_standby_name }}"
+  become: true
+  become_user: oracle
+  ansible.builtin.copy:
+    dest: /tmp/initStandby.ora
+    mode: '0644'
+    content: |
+      DB_NAME={{ rac_db_name }}
+      DB_UNIQUE_NAME={{ rac_db_name }}_STDBY
+      db_create_file_dest=+DATA
+      db_recovery_file_dest=+FRA
+      db_recovery_file_dest_size=8G
+
+- name: Clean up stale spfile on standby (prevents RMAN-05537 on re-run)
+  delegate_to: "{{ rac_standby_name }}"
+  become: true
+  become_user: oracle
+  ansible.builtin.shell: |
+    export ORACLE_HOME=/u01/app/oracle/product/26ai/dbhome_1
+    export ORACLE_SID={{ rac_db_name }}
+    export PATH=$ORACLE_HOME/bin:$PATH
+    # Shut down if running (previous failed RMAN may have left it up)
+    sqlplus -s / as sysdba <<EOF
+    SHUTDOWN ABORT;
+    EXIT;
+    EOF
+    # Remove stale spfile — RMAN DUPLICATE needs a clean pfile start
+    rm -f $ORACLE_HOME/dbs/spfile{{ rac_db_name }}.ora
+    rm -f +DATA/{{ rac_db_name }}_STDBY/spfile{{ rac_db_name }}.ora 2>/dev/null || true
+  failed_when: false
+  changed_when: false
+
+- name: Fix Grid home oracle binary permissions on standby (setuid for ASM access)
+  delegate_to: "{{ rac_standby_name }}"
+  ansible.builtin.file:
+    path: /u01/app/26ai/grid/bin/oracle
+    owner: grid
+    group: asmadmin
+    mode: '6751'
+  failed_when: false
+
+- name: Start standby instance in NOMOUNT
+  delegate_to: "{{ rac_standby_name }}"
+  become: true
+  become_user: oracle
+  ansible.builtin.shell: |
+    export ORACLE_HOME=/u01/app/oracle/product/26ai/dbhome_1
+    export ORACLE_SID={{ rac_db_name }}
+    export PATH=$ORACLE_HOME/bin:$PATH
+
+    sqlplus -s / as sysdba <<EOF
+    STARTUP NOMOUNT PFILE='/tmp/initStandby.ora';
+    EXIT;
+    EOF
+  register: stby_nomount_result
+
+# ==================================================================
+# RMAN DUPLICATE — standard ASM, no path overrides needed
+# ==================================================================
+- name: Create physical standby via RMAN DUPLICATE
+  delegate_to: "{{ rac_node_names[0] }}"
+  become: true
+  become_user: oracle
+  ansible.builtin.shell: |
+    export ORACLE_HOME=/u01/app/oracle/product/26ai/dbhome_1
+    export ORACLE_SID={{ rac_db_name }}
+    export TNS_ADMIN=$ORACLE_HOME/network/admin
+    export PATH=$ORACLE_HOME/bin:$PATH
+
+    rman TARGET sys/{{ rac_oracle_password }}@{{ rac_db_name }}_PRIMARY \
+         AUXILIARY sys/{{ rac_oracle_password }}@{{ rac_db_name }}_STDBY <<EOF
+    DUPLICATE TARGET DATABASE
+      FOR STANDBY
+      FROM ACTIVE DATABASE
+      DORECOVER
+      SPFILE
+        SET DB_UNIQUE_NAME='{{ rac_db_name }}_STDBY'
+        SET LOG_ARCHIVE_DEST_1='LOCATION=USE_DB_RECOVERY_FILE_DEST VALID_FOR=(ALL_LOGFILES,ALL_ROLES) DB_UNIQUE_NAME={{ rac_db_name }}_STDBY'
+        SET FAL_SERVER='{{ rac_db_name }}_PRIMARY'
+        SET FAL_CLIENT='{{ rac_db_name }}_STDBY'
+      NOFILENAMECHECK;
+    EXIT;
+    EOF
+  register: rman_duplicate_result
+  async: 3600
+  poll: 30
+
+# ==================================================================
+# Redo transport
+# ==================================================================
+- name: Configure redo transport on primary
+  delegate_to: "{{ rac_node_names[0] }}"
+  become: true
+  become_user: oracle
+  ansible.builtin.shell: |
+    export ORACLE_HOME=/u01/app/oracle/product/26ai/dbhome_1
+    export ORACLE_SID={{ rac_db_name }}
+    export PATH=$ORACLE_HOME/bin:$PATH
+
+    sqlplus -s / as sysdba <<EOF
+    ALTER SYSTEM SET LOG_ARCHIVE_CONFIG='DG_CONFIG=({{ rac_db_name }},{{ rac_db_name }}_STDBY)' SCOPE=BOTH;
+    ALTER SYSTEM SET LOG_ARCHIVE_DEST_2='SERVICE={{ rac_db_name }}_STDBY ASYNC VALID_FOR=(ONLINE_LOGFILES,PRIMARY_ROLE) DB_UNIQUE_NAME={{ rac_db_name }}_STDBY' SCOPE=BOTH;
+    ALTER SYSTEM SET LOG_ARCHIVE_DEST_STATE_2=ENABLE SCOPE=BOTH;
+    EXIT;
+    EOF
+
+- name: Configure redo transport on standby (for switchover)
+  delegate_to: "{{ rac_standby_name }}"
+  become: true
+  become_user: oracle
+  ansible.builtin.shell: |
+    export ORACLE_HOME=/u01/app/oracle/product/26ai/dbhome_1
+    export ORACLE_SID={{ rac_db_name }}
+    export PATH=$ORACLE_HOME/bin:$PATH
+
+    sqlplus -s / as sysdba <<EOF
+    ALTER SYSTEM SET LOG_ARCHIVE_CONFIG='DG_CONFIG=({{ rac_db_name }},{{ rac_db_name }}_STDBY)' SCOPE=BOTH;
+    ALTER SYSTEM SET LOG_ARCHIVE_DEST_2='SERVICE={{ rac_db_name }}_PRIMARY ASYNC VALID_FOR=(ONLINE_LOGFILES,PRIMARY_ROLE) DB_UNIQUE_NAME={{ rac_db_name }}' SCOPE=BOTH;
+    ALTER SYSTEM SET LOG_ARCHIVE_DEST_STATE_2=ENABLE SCOPE=BOTH;
+    EXIT;
+    EOF
+
+# ==================================================================
+# Start Managed Recovery
+# ==================================================================
+- name: Start managed recovery on standby
+  delegate_to: "{{ rac_standby_name }}"
+  become: true
+  become_user: oracle
+  ansible.builtin.shell: |
+    export ORACLE_HOME=/u01/app/oracle/product/26ai/dbhome_1
+    export ORACLE_SID={{ rac_db_name }}
+    export PATH=$ORACLE_HOME/bin:$PATH
+
+    sqlplus -s / as sysdba <<EOF
+    ALTER DATABASE RECOVER MANAGED STANDBY DATABASE DISCONNECT FROM SESSION;
+    EXIT;
+    EOF
+  register: mrp_start_result
+
+- name: Display standby installation result
+  ansible.builtin.debug:
+    msg:
+      - "Standby database created (ASM backed, Grid Infrastructure)"
+      - "  Standby VM:   {{ rac_standby_name }}"
+      - "  Standby IP:   {{ rac_standby_ip }}"
+      - "  Grid Home:    /u01/app/26ai/grid"
+      - "  DB Home:      /u01/app/oracle/product/26ai/dbhome_1"
+      - "  ASM:          +DATA, +FRA"
+      - "  DB Unique:    {{ rac_db_name }}_STDBY"
+      - "  Redo apply:   Managed Recovery Process started"

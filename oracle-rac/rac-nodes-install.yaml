@@ -1,0 +1,68 @@
+---
+# Provision RAC node VMs (or single primary for DG-only topologies).
+# Each VM gets:
+#   - System disk (qcow2 → raw, PV/PVC, same pattern as redhat-vm-install)
+#   - Multus secondary NIC for RAC interconnect (if rac_nodes > 0)
+#   - Shared ASM hostDisk volumes with serial numbers (if rac_nodes > 0)
+#   - Cloud-init with Oracle-required kernel params, /etc/hosts, packages
+
+- name: Set node list for provisioning
+  ansible.builtin.set_fact:
+    rac_provision_nodes: >-
+      {{ rac_node_names | default(['rac-node1', 'rac-node2']) }}
+
+- name: Get node hostname for PV affinity
+  ansible.builtin.shell: kubectl get nodes -o jsonpath='{.items[0].metadata.name}'
+  register: node_hostname
+  changed_when: false
+
+- name: Compute absolute storage directory
+  ansible.builtin.set_fact:
+    storage_abs_dir: "{{ storage_dir }}"
+
+# ---- Per-node loop: PV, PVC, qcow2 conversion, VM creation ----
+- name: Provision each RAC node VM
+  ansible.builtin.include_tasks: rac-node-provision-single.yaml
+  loop: "{{ rac_provision_nodes }}"
+  loop_control:
+    loop_var: current_node_name
+    index_var: node_idx
+
+# ---- Wait for all VMs to be running ----
+- name: Wait for all RAC node VMs to reach Running state
+  kubernetes.core.k8s_info:
+    api_version: kubevirt.io/v1
+    kind: VirtualMachine
+    name: "{{ item }}"
+    namespace: "{{ kubevirt_namespace }}"
+  register: vm_running_check
+  until: >-
+    vm_running_check.resources | length > 0 and
+    vm_running_check.resources[0].status.printableStatus | default('') == 'Running'
+  retries: 40
+  delay: 10
+  loop: "{{ rac_provision_nodes }}"
+  loop_control:
+    label: "{{ item }}"
+
+# ---- Build IP map from static L2 addresses ----
+- name: Build node IP map (L2 static IPs)
+  ansible.builtin.set_fact:
+    rac_node_ips: >-
+      {{ dict(rac_provision_nodes | zip([rac_node1_priv_ip, rac_node2_priv_ip][:rac_provision_nodes | length])) }}
+
+- name: Wait for SSH on L2 IPs (cloud-init must configure the NIC first)
+  ansible.builtin.wait_for:
+    host: "{{ item.value }}"
+    port: 22
+    timeout: 600
+    delay: 30
+  loop: "{{ rac_node_ips | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+
+- name: Display provisioned nodes
+  ansible.builtin.debug:
+    msg:
+      - "✅ RAC node VMs provisioned and running"
+      - "  Node IPs (L2): {{ rac_node_ips }}"

@@ -38,4 +38,17 @@ archive/
 *.log
 __pycache__
 *.pyc
+*.rpm
+*.bin
+*.deb
+*.msi
+*.dmg
+*.pkg
+*.apk
+*.app
+*.dll
+*.zip
+*.tar.gz
+*.tar.bz2
+
 

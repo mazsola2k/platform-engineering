@@ -1,0 +1,17 @@
+---
+# Uninstall RAC node VMs — delete VM, PVC, PV, and hostPath data for each node.
+
+- name: Set node list for uninstall
+  ansible.builtin.set_fact:
+    rac_uninstall_nodes: >-
+      {{ rac_node_names | default(['rac-node1', 'rac-node2']) }}
+
+- name: Delete each RAC node VM and storage
+  ansible.builtin.include_tasks: rac-node-remove-single.yaml
+  loop: "{{ rac_uninstall_nodes }}"
+  loop_control:
+    loop_var: current_node_name
+
+- name: Display node cleanup status
+  ansible.builtin.debug:
+    msg: "✅ RAC node VMs removed: {{ rac_uninstall_nodes | join(', ') }}"

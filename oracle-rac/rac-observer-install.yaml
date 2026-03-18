@@ -1,0 +1,342 @@
+---
+# Provision FSFO Observer VM.
+# A lightweight VM running Oracle Instant Client + dgmgrl OBSERVE as a systemd service.
+
+# ---- Provision observer VM ----
+- name: Get node hostname for PV affinity
+  ansible.builtin.shell: kubectl get nodes -o jsonpath='{.items[0].metadata.name}'
+  register: node_hostname
+  changed_when: false
+
+- name: Compute storage directory
+  ansible.builtin.set_fact:
+    storage_abs_dir: "{{ storage_dir }}"
+
+# ---- PV ----
+- name: "{{ rac_observer_name }} — Check for existing PV"
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: PersistentVolume
+    name: "{{ rac_observer_name }}-system-pv"
+  register: obs_pv_check
+  failed_when: false
+
+- name: "{{ rac_observer_name }} — Create PersistentVolume"
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: PersistentVolume
+      metadata:
+        name: "{{ rac_observer_name }}-system-pv"
+        labels:
+          type: local
+          app: "{{ rac_observer_name }}"
+      spec:
+        capacity:
+          storage: "{{ rac_observer_disk }}"
+        accessModes: ["ReadWriteOnce"]
+        persistentVolumeReclaimPolicy: Retain
+        storageClassName: local-storage
+        volumeMode: Filesystem
+        hostPath:
+          path: "{{ storage_abs_dir }}/{{ rac_observer_name }}-system-disk"
+          type: DirectoryOrCreate
+        nodeAffinity:
+          required:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: In
+                    values: ["{{ node_hostname.stdout }}"]
+  when: obs_pv_check.resources | length == 0
+
+# ---- PVC ----
+- name: "{{ rac_observer_name }} — Check for existing PVC"
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: PersistentVolumeClaim
+    name: "{{ rac_observer_name }}-system-disk"
+    namespace: "{{ kubevirt_namespace }}"
+  register: obs_pvc_check
+  failed_when: false
+
+- name: "{{ rac_observer_name }} — Create PersistentVolumeClaim"
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata:
+        name: "{{ rac_observer_name }}-system-disk"
+        namespace: "{{ kubevirt_namespace }}"
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: "{{ rac_observer_disk }}"
+        storageClassName: local-storage
+        volumeMode: Filesystem
+        volumeName: "{{ rac_observer_name }}-system-pv"
+  when: obs_pvc_check.resources | length == 0
+
+# ---- Disk prep ----
+- name: "{{ rac_observer_name }} — Ensure PV directory"
+  ansible.builtin.file:
+    path: "{{ storage_abs_dir }}/{{ rac_observer_name }}-system-disk"
+    state: directory
+    mode: '0777'
+  become: true
+
+- name: "{{ rac_observer_name }} — Check if disk.img exists"
+  ansible.builtin.stat:
+    path: "{{ storage_abs_dir }}/{{ rac_observer_name }}-system-disk/disk.img"
+  register: obs_disk_check
+
+- name: "{{ rac_observer_name }} — Convert qcow2 to raw"
+  ansible.builtin.command:
+    cmd: "qemu-img convert -f qcow2 -O raw '{{ qcow2_image_path }}' '{{ storage_abs_dir }}/{{ rac_observer_name }}-system-disk/disk.img'"
+  when: not obs_disk_check.stat.exists
+  become: true
+
+- name: "{{ rac_observer_name }} — Resize raw disk"
+  ansible.builtin.command:
+    cmd: "qemu-img resize '{{ storage_abs_dir }}/{{ rac_observer_name }}-system-disk/disk.img' {{ rac_observer_disk | regex_replace('Gi$', 'G') }}"
+  when: not obs_disk_check.stat.exists
+  become: true
+
+- name: "{{ rac_observer_name }} — Set ownership"
+  ansible.builtin.file:
+    path: "{{ storage_abs_dir }}/{{ rac_observer_name }}-system-disk/disk.img"
+    owner: qemu
+    group: qemu
+    mode: '0644'
+  become: true
+
+# ---- Create observer VM (lightweight, no Oracle DB, just Instant Client) ----
+- name: "{{ rac_observer_name }} — Create VirtualMachine"
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: kubevirt.io/v1
+      kind: VirtualMachine
+      metadata:
+        name: "{{ rac_observer_name }}"
+        namespace: "{{ kubevirt_namespace }}"
+        labels:
+          app: oracle-rac
+          role: observer
+      spec:
+        running: true
+        template:
+          metadata:
+            labels:
+              kubevirt.io/domain: "{{ rac_observer_name }}"
+              app: oracle-rac
+          spec:
+            domain:
+              cpu:
+                cores: "{{ rac_observer_cpu | int }}"
+              devices:
+                disks:
+                  - name: rootdisk
+                    disk:
+                      bus: virtio
+                  - name: cloudinitdisk
+                    disk:
+                      bus: virtio
+              resources:
+                requests:
+                  memory: "{{ rac_observer_memory }}"
+            volumes:
+              - name: rootdisk
+                persistentVolumeClaim:
+                  claimName: "{{ rac_observer_name }}-system-disk"
+              - name: cloudinitdisk
+                cloudInitNoCloud:
+                  userData: |
+                    #cloud-config
+                    hostname: {{ rac_observer_name }}
+                    disable_root: false
+                    ssh_pwauth: true
+                    users:
+                      - name: oracle
+                        sudo: ALL=(ALL) NOPASSWD:ALL
+                        lock_passwd: false
+                    chpasswd:
+                      list: |
+                        root:{{ rac_oracle_password }}
+                        oracle:{{ rac_oracle_password }}
+                      expire: False
+                    write_files:
+                      - path: /etc/ssh/sshd_config.d/99-cloud-init.conf
+                        content: |
+                          PermitRootLogin yes
+                          PasswordAuthentication yes
+                          ChallengeResponseAuthentication no
+                          UsePAM yes
+                    runcmd:
+                      - growpart /dev/vda 1
+                      - resize2fs /dev/vda1 || xfs_growfs /
+                      - systemctl reload sshd
+                      - |
+                        subscription-manager register \
+                          --username="{{ subscription_username }}" \
+                          --password="{{ subscription_password }}" \
+                          --auto-attach 2>&1 || true
+                      - subscription-manager repos --enable=rhel-9-for-x86_64-baseos-rpms --enable=rhel-9-for-x86_64-appstream-rpms 2>&1 || true
+                      - echo "cloud-init observer setup complete" | tee /var/log/cloudinit-observer.log
+
+# ---- Wait for observer VM ----
+- name: "{{ rac_observer_name }} — Wait for VM Running"
+  kubernetes.core.k8s_info:
+    api_version: kubevirt.io/v1
+    kind: VirtualMachine
+    name: "{{ rac_observer_name }}"
+    namespace: "{{ kubevirt_namespace }}"
+  register: obs_vm_status
+  until: >-
+    obs_vm_status.resources | length > 0 and
+    obs_vm_status.resources[0].status.printableStatus | default('') == 'Running'
+  retries: 40
+  delay: 10
+
+- name: "{{ rac_observer_name }} — Get VMI IP"
+  kubernetes.core.k8s_info:
+    api_version: kubevirt.io/v1
+    kind: VirtualMachineInstance
+    name: "{{ rac_observer_name }}"
+    namespace: "{{ kubevirt_namespace }}"
+  register: obs_vmi
+
+- name: Set observer IP
+  ansible.builtin.set_fact:
+    rac_observer_ip: "{{ obs_vmi.resources[0].status.interfaces[0].ipAddress }}"
+
+- name: Add observer to inventory
+  ansible.builtin.add_host:
+    name: "{{ rac_observer_name }}"
+    ansible_host: "{{ rac_observer_ip }}"
+    ansible_user: "oracle"
+    ansible_password: "{{ rac_oracle_password }}"
+    ansible_become: true
+    ansible_become_method: sudo
+    ansible_ssh_common_args: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+
+- name: Wait for SSH on observer
+  ansible.builtin.wait_for:
+    host: "{{ rac_observer_ip }}"
+    port: 22
+    timeout: 300
+    delay: 10
+
+# ---- Install Oracle Instant Client + dgmgrl on observer ----
+- name: Install Oracle Instant Client on observer
+  delegate_to: "{{ rac_observer_name }}"
+  ansible.builtin.shell: |
+    dnf install -y oracle-instantclient-release-26ai 2>&1 || true
+    dnf install -y oracle-instantclient-basic oracle-instantclient-sqlplus oracle-instantclient-tools 2>&1 || {
+      # Fallback: install from Oracle RPM directly
+      dnf install -y https://download.oracle.com/otn_software/linux/instantclient/2326100/oracle-instantclient-basic-23.26.1.0.0-1.el9.x86_64.rpm 2>&1 || true
+      dnf install -y https://download.oracle.com/otn_software/linux/instantclient/2326100/oracle-instantclient-sqlplus-23.26.1.0.0-1.el9.x86_64.rpm 2>&1 || true
+      dnf install -y https://download.oracle.com/otn_software/linux/instantclient/2326100/oracle-instantclient-tools-23.26.1.0.0-1.el9.x86_64.rpm 2>&1 || true
+    }
+  register: ic_install
+
+# ---- Configure TNS for observer ----
+- name: Get primary IP for observer TNS
+  kubernetes.core.k8s_info:
+    api_version: kubevirt.io/v1
+    kind: VirtualMachineInstance
+    name: "{{ rac_node_names[0] }}"
+    namespace: "{{ kubevirt_namespace }}"
+  register: obs_primary_vmi
+
+- name: Get standby IP for observer TNS
+  kubernetes.core.k8s_info:
+    api_version: kubevirt.io/v1
+    kind: VirtualMachineInstance
+    name: "{{ rac_standby_name }}"
+    namespace: "{{ kubevirt_namespace }}"
+  register: obs_standby_vmi
+
+- name: Set IPs for observer TNS
+  ansible.builtin.set_fact:
+    obs_primary_ip: "{{ obs_primary_vmi.resources[0].status.interfaces[0].ipAddress }}"
+    obs_standby_ip: "{{ obs_standby_vmi.resources[0].status.interfaces[0].ipAddress }}"
+
+- name: Create tnsnames.ora on observer
+  delegate_to: "{{ rac_observer_name }}"
+  ansible.builtin.copy:
+    dest: /etc/oracle/tnsnames.ora
+    mode: '0644'
+    content: |
+      {{ rac_db_name }}_PRIMARY =
+        (DESCRIPTION =
+          (ADDRESS = (PROTOCOL = TCP)(HOST = {{ obs_primary_ip }})(PORT = 1521))
+          (CONNECT_DATA =
+            (SERVER = DEDICATED)
+            (SERVICE_NAME = {{ rac_db_name }})
+          )
+        )
+
+      {{ rac_db_name }}_STDBY =
+        (DESCRIPTION =
+          (ADDRESS = (PROTOCOL = TCP)(HOST = {{ obs_standby_ip }})(PORT = 1521))
+          (CONNECT_DATA =
+            (SERVER = DEDICATED)
+            (SERVICE_NAME = {{ rac_db_name }})
+          )
+        )
+
+- name: Create oracle environment profile on observer
+  delegate_to: "{{ rac_observer_name }}"
+  ansible.builtin.copy:
+    dest: /etc/profile.d/oracle.sh
+    mode: '0644'
+    content: |
+      export TNS_ADMIN=/etc/oracle
+      export LD_LIBRARY_PATH=/usr/lib/oracle/23/client64/lib:$LD_LIBRARY_PATH
+      export PATH=/usr/lib/oracle/23/client64/bin:$PATH
+
+# ---- Create systemd service for FSFO observer ----
+- name: Create FSFO observer systemd service
+  delegate_to: "{{ rac_observer_name }}"
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/oracle-fsfo-observer.service
+    mode: '0644'
+    content: |
+      [Unit]
+      Description=Oracle FSFO Observer (dgmgrl)
+      After=network-online.target
+      Wants=network-online.target
+
+      [Service]
+      Type=simple
+      User=oracle
+      Environment=TNS_ADMIN=/etc/oracle
+      Environment=LD_LIBRARY_PATH=/usr/lib/oracle/23/client64/lib
+      Environment=PATH=/usr/lib/oracle/23/client64/bin:/usr/local/bin:/usr/bin:/bin
+      ExecStart=/usr/lib/oracle/23/client64/bin/dgmgrl -logfile /var/log/oracle-observer.log sys/{{ rac_oracle_password }}@{{ rac_db_name }}_PRIMARY "OBSERVE"
+      Restart=always
+      RestartSec=30
+
+      [Install]
+      WantedBy=multi-user.target
+
+- name: Enable and start FSFO observer service
+  delegate_to: "{{ rac_observer_name }}"
+  ansible.builtin.systemd:
+    name: oracle-fsfo-observer
+    state: started
+    enabled: true
+    daemon_reload: true
+
+- name: Display observer installation result
+  ansible.builtin.debug:
+    msg:
+      - "✅ FSFO Observer installed and running"
+      - "  Observer VM:  {{ rac_observer_name }}"
+      - "  Observer IP:  {{ rac_observer_ip }}"
+      - "  Service:      oracle-fsfo-observer.service"
+      - "  Log:          /var/log/oracle-observer.log"

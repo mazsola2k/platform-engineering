@@ -1,0 +1,174 @@
+---
+# OTel Collector integration for Oracle RAC cluster.
+# Wires per-instance Oracle receivers for each RAC node + standby database.
+# Extends the existing otel-oracle-install.yaml pattern.
+
+- name: Assert OTel endpoint provided
+  ansible.builtin.assert:
+    that:
+      - oracle_otel_endpoint | default('') | length > 0
+    fail_msg: "oracle_otel_endpoint must be provided for Oracle RAC telemetry."
+
+# ---- Build list of Oracle instances to monitor ----
+- name: Collect all RAC node VMI IPs
+  kubernetes.core.k8s_info:
+    api_version: kubevirt.io/v1
+    kind: VirtualMachineInstance
+    name: "{{ item }}"
+    namespace: "{{ kubevirt_namespace }}"
+  register: _otel_rac_vmis
+  loop: "{{ rac_node_names }}"
+  loop_control:
+    label: "{{ item }}"
+  failed_when: false
+
+- name: Build RAC instance list for OTel
+  ansible.builtin.set_fact:
+    otel_oracle_instances: >-
+      {{ otel_oracle_instances | default([]) + [{
+        'name': item.item,
+        'address': item.resources[0].status.interfaces[0].ipAddress,
+        'port': oracle_listener_port | default(1521),
+        'service': rac_pdb_name,
+        'sid': rac_db_name ~ (loop_idx + 1) | string,
+        'role': 'primary'
+      }] }}
+  loop: "{{ _otel_rac_vmis.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+    index_var: loop_idx
+  when: item.resources | length > 0
+
+# ---- Add standby instance (if Data Guard enabled) ----
+- name: Get standby VMI IP for OTel
+  kubernetes.core.k8s_info:
+    api_version: kubevirt.io/v1
+    kind: VirtualMachineInstance
+    name: "{{ rac_standby_name }}"
+    namespace: "{{ kubevirt_namespace }}"
+  register: _otel_stby_vmi
+  when: rac_dataguard | bool
+  failed_when: false
+
+- name: Add standby to OTel instance list
+  ansible.builtin.set_fact:
+    otel_oracle_instances: >-
+      {{ otel_oracle_instances | default([]) + [{
+        'name': rac_standby_name,
+        'address': _otel_stby_vmi.resources[0].status.interfaces[0].ipAddress,
+        'port': oracle_listener_port | default(1521),
+        'service': rac_pdb_name,
+        'sid': rac_db_name,
+        'role': 'standby'
+      }] }}
+  when: rac_dataguard | bool and _otel_stby_vmi.resources | default([]) | length > 0
+
+- name: Display OTel instance list
+  ansible.builtin.debug:
+    msg:
+      - "Oracle RAC OTel instances to monitor:"
+      - "{{ otel_oracle_instances | default([]) }}"
+
+# ---- Generate per-instance OTel receiver configuration ----
+- name: Set OTel collector ConfigMap name
+  ansible.builtin.set_fact:
+    otel_rac_configmap_name: "otel-collector-oracle-rac-config"
+
+- name: Build OTel collector configuration for RAC
+  ansible.builtin.set_fact:
+    otel_rac_config:
+      receivers: >-
+        {{ dict(otel_oracle_instances | default([]) | map(attribute='name') | zip(
+          otel_oracle_instances | default([]) | map('combine', {}) | list
+        )) | to_json }}
+      # The config is built as a template; the actual YAML is rendered below
+
+- name: Create OTel Collector ConfigMap for Oracle RAC
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: "{{ otel_rac_configmap_name }}"
+        namespace: "{{ kubevirt_namespace }}"
+        labels:
+          app: otel-collector
+          component: oracle-rac
+      data:
+        otel-collector-oracle-rac.yaml: |
+          receivers:
+          {% for instance in otel_oracle_instances | default([]) %}
+            oracledb/{{ instance.name }}:
+              endpoint: {{ instance.address }}:{{ instance.port }}
+              service: {{ instance.service }}
+              username: {{ oracle_metrics_username | default('appuser') }}
+              password: {{ oracle_metrics_password | default(rac_oracle_password) }}
+              metrics:
+                oracledb.cpu_time:
+                  enabled: true
+                oracledb.physical_reads:
+                  enabled: true
+                oracledb.sessions.usage:
+                  enabled: true
+                oracledb.tablespace_size.usage:
+                  enabled: true
+                oracledb.enqueue_deadlocks:
+                  enabled: true
+                oracledb.executions:
+                  enabled: true
+                oracledb.hard_parses:
+                  enabled: true
+                oracledb.parse_calls:
+                  enabled: true
+                oracledb.pga_memory:
+                  enabled: true
+                oracledb.user_commits:
+                  enabled: true
+                oracledb.user_rollbacks:
+                  enabled: true
+          {% endfor %}
+
+          processors:
+            attributes/rac:
+              actions:
+          {% for instance in otel_oracle_instances | default([]) %}
+                - key: db.instance
+                  value: {{ instance.name }}
+                  action: upsert
+                - key: db.role
+                  value: {{ instance.role }}
+                  action: upsert
+          {% endfor %}
+            batch:
+              send_batch_size: 1000
+              timeout: 10s
+
+          exporters:
+            otlphttp:
+              endpoint: {{ oracle_otel_endpoint }}
+              {% if oracle_otel_token | default('') | length > 0 %}
+              headers:
+                Authorization: "Api-Token {{ oracle_otel_token }}"
+              {% endif %}
+
+          service:
+            pipelines:
+              metrics/oracle-rac:
+                receivers:
+          {% for instance in otel_oracle_instances | default([]) %}
+                  - oracledb/{{ instance.name }}
+          {% endfor %}
+                processors:
+                  - attributes/rac
+                  - batch
+                exporters:
+                  - otlphttp
+
+- name: Display OTel configuration status
+  ansible.builtin.debug:
+    msg:
+      - "✅ OTel Collector configuration created for Oracle RAC"
+      - "  ConfigMap: {{ otel_rac_configmap_name }}"
+      - "  Instances: {{ otel_oracle_instances | default([]) | map(attribute='name') | list | join(', ') }}"
+      - "  Endpoint:  {{ oracle_otel_endpoint }}"
