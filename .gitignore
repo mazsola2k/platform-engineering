@@ -48,7 +48,9 @@ __pycache__
 *.app
 *.dll
 *.zip
-*.tar.gz
-*.tar.bz2
+*.html
+*.txt
+
+
 
 

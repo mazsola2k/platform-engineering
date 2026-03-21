@@ -15,6 +15,10 @@
 #   Install (RAC only): ansible-playbook oracle-rac-controller.yaml -e rac_action=install -e rac_dataguard=false
 #   Uninstall:         ansible-playbook oracle-rac-controller.yaml -e rac_action=uninstall
 #   Status:            ansible-playbook oracle-rac-controller.yaml -e rac_action=status
+#   AWR Report:        ansible-playbook oracle-rac-controller.yaml -e rac_action=awr
+#   AWR (time range):  ansible-playbook oracle-rac-controller.yaml -e rac_action=awr -e "awr_begin_time='2026-03-21 10:00'" -e "awr_end_time='2026-03-21 12:00'"
+#   AWR (snap IDs):    ansible-playbook oracle-rac-controller.yaml -e rac_action=awr -e awr_begin_snap=1 -e awr_end_snap=5
+#   AWR (fresh):       ansible-playbook oracle-rac-controller.yaml -e rac_action=awr -e awr_wait_secs=60
 
 - name: Oracle RAC Cluster Controller
   hosts: localhost
@@ -98,8 +102,8 @@
 
     - name: Validate action parameter
       ansible.builtin.fail:
-        msg: "Invalid rac_action '{{ rac_action }}'. Must be one of: install, uninstall, status"
-      when: rac_action not in ['install', 'uninstall', 'status']
+        msg: "Invalid rac_action '{{ rac_action }}'. Must be one of: install, uninstall, status, awr"
+      when: rac_action not in ['install', 'uninstall', 'status', 'awr']
 
     - name: Validate topology combination
       ansible.builtin.fail:
@@ -170,6 +174,11 @@
     - name: Status — Check cluster status
       ansible.builtin.include_tasks: oracle-rac/rac-status.yaml
       when: rac_action == 'status'
+
+    # ==================== DIAGNOSTICS (AWR/ASH/ADDM/SQL Monitor/SQL Tuning/Health) ====================
+    - name: Diagnostics — Generate diagnostic reports
+      ansible.builtin.include_tasks: oracle-rac/rac-diagnostics.yaml
+      when: rac_action == 'awr'
 
     # ==================== UNINSTALL ====================
     - name: Uninstall — Remove FSFO Observer

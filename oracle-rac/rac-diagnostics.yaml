@@ -1,0 +1,1077 @@
+---
+# Oracle Diagnostic Report Generator
+# Generates up to 7 reports: AWR, AWR Diff, ADDM, ASH, SQL Monitor,
+# SQL Tuning Advisor, and Health Monitor.
+# Also displays blocked sessions, long-running SQL, and top SQL in the summary.
+#
+# Default: last 24 hours from current time.
+# The AWR Diff report compares the first half vs second half of the period.
+# ADDM analyzes the AWR data and provides tuning recommendations.
+# ASH shows active session history with wait events and SQL details.
+# SQL Monitor shows recent/active SQL executions with execution plans.
+# SQL Tuning Advisor provides tuning recommendations for the top SQL.
+# Health Monitor runs integrity checks on dictionary, redo, and data blocks.
+#
+# Reports are fetched to: ./oracle-rac/awr_report_<timestamp>.html
+#                         ./oracle-rac/awr_diff_<timestamp>.html
+#                         ./oracle-rac/addm_report_<timestamp>.txt
+#                         ./oracle-rac/ash_report_<timestamp>.html
+#                         ./oracle-rac/sqlmon_report_<timestamp>.html
+#                         ./oracle-rac/sqltune_report_<timestamp>.txt
+#                         ./oracle-rac/healthmon_report_<timestamp>.html
+#
+# Parameters (all optional — pass via -e):
+#   awr_begin_time  — Start time  (format: 'YYYY-MM-DD HH24:MI', default: now - 24h)
+#   awr_end_time    — End time    (format: 'YYYY-MM-DD HH24:MI', default: now)
+#   awr_begin_snap  — Explicit begin snap_id (overrides time filter)
+#   awr_end_snap    — Explicit end snap_id   (overrides time filter)
+#   awr_wait_secs   — Sample window when creating new snapshots (default: 10)
+#   awr_hours       — Hours to look back (default: 24, ignored if awr_begin_time set)
+#
+# Usage:
+#   Default (24h):     ansible-playbook oracle-rac-controller.yaml -e rac_action=awr
+#   Last 8 hours:      ansible-playbook oracle-rac-controller.yaml -e rac_action=awr -e awr_hours=8
+#   Time range:        ansible-playbook oracle-rac-controller.yaml -e rac_action=awr \
+#                        -e "awr_begin_time='2026-03-21 10:00'" -e "awr_end_time='2026-03-21 12:00'"
+#   Explicit snaps:    ansible-playbook oracle-rac-controller.yaml -e rac_action=awr \
+#                        -e awr_begin_snap=1 -e awr_end_snap=5
+#   Fresh capture:     ansible-playbook oracle-rac-controller.yaml -e rac_action=awr -e awr_wait_secs=60
+
+# ---- Connect to primary ----
+- name: Set primary L2 IP for AWR
+  ansible.builtin.set_fact:
+    _awr_primary_ip: "{{ rac_node1_priv_ip }}"
+    _awr_wait_secs: "{{ awr_wait_secs | default(10) }}"
+    _awr_hours: "{{ awr_hours | default(24) }}"
+    _awr_has_explicit_snaps: "{{ (awr_begin_snap is defined) and (awr_end_snap is defined) }}"
+    _awr_has_user_time: "{{ (awr_begin_time is defined) and (awr_end_time is defined) }}"
+
+- name: Compute default time window (last {{ _awr_hours }}h)
+  ansible.builtin.shell: |
+    echo "BEGIN_TIME=$(date -d '{{ _awr_hours }} hours ago' '+%Y-%m-%d %H:%M')"
+    echo "END_TIME=$(date '+%Y-%m-%d %H:%M')"
+  register: _awr_time_calc
+  changed_when: false
+  when: not (_awr_has_explicit_snaps | bool) and not (_awr_has_user_time | bool)
+
+- name: Set computed time window
+  ansible.builtin.set_fact:
+    _awr_begin_time: "{{ (_awr_time_calc.stdout_lines | select('match', '^BEGIN_TIME=') | first).split('=', 1)[1] }}"
+    _awr_end_time: "{{ (_awr_time_calc.stdout_lines | select('match', '^END_TIME=') | first).split('=', 1)[1] }}"
+  when: not (_awr_has_explicit_snaps | bool) and not (_awr_has_user_time | bool)
+
+- name: Set user-provided time window
+  ansible.builtin.set_fact:
+    _awr_begin_time: "{{ awr_begin_time }}"
+    _awr_end_time: "{{ awr_end_time }}"
+  when: (_awr_has_user_time | bool) and not (_awr_has_explicit_snaps | bool)
+
+- name: Display time window
+  ansible.builtin.debug:
+    msg: "AWR time window: {{ _awr_begin_time }} → {{ _awr_end_time }} ({{ _awr_hours }}h lookback)"
+  when: not (_awr_has_explicit_snaps | bool)
+
+- name: Add primary to inventory for AWR
+  ansible.builtin.add_host:
+    name: "{{ rac_node_names[0] }}"
+    ansible_host: "{{ _awr_primary_ip }}"
+    ansible_user: "oracle"
+    ansible_password: "{{ rac_oracle_password }}"
+    ansible_become: true
+    ansible_become_method: sudo
+    ansible_ssh_common_args: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+
+- name: Wait for SSH on primary
+  ansible.builtin.wait_for:
+    host: "{{ _awr_primary_ip }}"
+    port: 22
+    timeout: 60
+
+# ---- Verify database is open ----
+- name: Verify primary database is OPEN
+  delegate_to: "{{ rac_node_names[0] }}"
+  become: true
+  become_user: oracle
+  ansible.builtin.shell: |
+    export ORACLE_HOME=/u01/app/oracle/product/26ai/dbhome_1
+    export ORACLE_SID={{ rac_db_name }}
+    export PATH=$ORACLE_HOME/bin:$PATH
+    sqlplus -s / as sysdba <<'EOF'
+    SET HEADING OFF FEEDBACK OFF PAGESIZE 0
+    SELECT status FROM v$instance;
+    EXIT;
+    EOF
+  register: _awr_db_status
+  changed_when: false
+
+- name: Fail if database is not open
+  ansible.builtin.fail:
+    msg: "Database is not OPEN (status: {{ _awr_db_status.stdout | trim }}). Cannot generate AWR report."
+  when: "'OPEN' not in _awr_db_status.stdout"
+
+# ---- List available AWR snapshots ----
+- name: List available AWR snapshots
+  delegate_to: "{{ rac_node_names[0] }}"
+  become: true
+  become_user: oracle
+  ansible.builtin.shell: |
+    export ORACLE_HOME=/u01/app/oracle/product/26ai/dbhome_1
+    export ORACLE_SID={{ rac_db_name }}
+    export PATH=$ORACLE_HOME/bin:$PATH
+    sqlplus -s / as sysdba <<'EOF'
+    SET LINESIZE 200
+    SET PAGESIZE 100
+    SET HEADING ON FEEDBACK OFF
+    COL snap_id FORMAT 99999
+    COL begin_time FORMAT A20
+    COL end_time FORMAT A20
+    SELECT snap_id,
+           TO_CHAR(begin_interval_time,'YYYY-MM-DD HH24:MI:SS') AS begin_time,
+           TO_CHAR(end_interval_time,'YYYY-MM-DD HH24:MI:SS') AS end_time
+    FROM dba_hist_snapshot
+    ORDER BY snap_id;
+    EXIT;
+    EOF
+  register: _awr_snap_list
+  changed_when: false
+
+- name: Display available snapshots
+  ansible.builtin.debug:
+    msg: "{{ _awr_snap_list.stdout_lines }}"
+
+# ==================================================================
+# Resolve snap IDs
+# ==================================================================
+
+# Mode 1: Explicit snap IDs provided
+- name: Use explicit snap IDs
+  ansible.builtin.set_fact:
+    _awr_begin_id: "{{ awr_begin_snap }}"
+    _awr_end_id: "{{ awr_end_snap }}"
+  when: _awr_has_explicit_snaps | bool
+
+# Mode 2: Time-based (default 24h or user override) — find matching snapshots
+- name: Find snapshots for time window
+  delegate_to: "{{ rac_node_names[0] }}"
+  become: true
+  become_user: oracle
+  ansible.builtin.shell: |
+    export ORACLE_HOME=/u01/app/oracle/product/26ai/dbhome_1
+    export ORACLE_SID={{ rac_db_name }}
+    export PATH=$ORACLE_HOME/bin:$PATH
+    sqlplus -s / as sysdba <<'EOF'
+    SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 200 TRIMOUT ON TRIMSPOOL ON
+    SELECT 'BEGIN_SNAP=' || snap_id FROM (
+      SELECT snap_id FROM dba_hist_snapshot
+      WHERE begin_interval_time >= TO_TIMESTAMP('{{ _awr_begin_time }}','YYYY-MM-DD HH24:MI')
+      ORDER BY snap_id ASC
+    ) WHERE ROWNUM = 1;
+    SELECT 'END_SNAP=' || snap_id FROM (
+      SELECT snap_id FROM dba_hist_snapshot
+      WHERE end_interval_time <= TO_TIMESTAMP('{{ _awr_end_time }}','YYYY-MM-DD HH24:MI')
+      ORDER BY snap_id DESC
+    ) WHERE ROWNUM = 1;
+    SELECT 'SNAP_COUNT=' || COUNT(*) FROM dba_hist_snapshot
+    WHERE begin_interval_time >= TO_TIMESTAMP('{{ _awr_begin_time }}','YYYY-MM-DD HH24:MI')
+      AND end_interval_time <= TO_TIMESTAMP('{{ _awr_end_time }}','YYYY-MM-DD HH24:MI');
+    EXIT;
+    EOF
+  register: _awr_time_snaps
+  changed_when: false
+  when: not (_awr_has_explicit_snaps | bool)
+
+- name: Check if snapshots exist in time window
+  ansible.builtin.set_fact:
+    _awr_time_snap_count: "{{ (_awr_time_snaps.stdout_lines | select('match', '.*SNAP_COUNT=') | list | first | default('SNAP_COUNT=0')).split('=')[1] | trim | int }}"
+  when: not (_awr_has_explicit_snaps | bool)
+
+# If we found snaps in the time window, parse them
+- name: Parse time-range snap IDs
+  ansible.builtin.set_fact:
+    _awr_begin_id: "{{ (_awr_time_snaps.stdout_lines | select('match', '.*BEGIN_SNAP=') | first).split('=')[1] | trim }}"
+    _awr_end_id: "{{ (_awr_time_snaps.stdout_lines | select('match', '.*END_SNAP=') | first).split('=')[1] | trim }}"
+  when:
+    - not (_awr_has_explicit_snaps | bool)
+    - _awr_time_snap_count | int >= 2
+
+# If not enough snaps in the window, create new ones
+- name: Display — creating fresh snapshots
+  ansible.builtin.debug:
+    msg: "Less than 2 snapshots in time window — creating fresh snapshots with {{ _awr_wait_secs }}s sample."
+  when:
+    - not (_awr_has_explicit_snaps | bool)
+    - _awr_time_snap_count | int < 2
+
+- name: Create BEGIN AWR snapshot
+  delegate_to: "{{ rac_node_names[0] }}"
+  become: true
+  become_user: oracle
+  ansible.builtin.shell: |
+    export ORACLE_HOME=/u01/app/oracle/product/26ai/dbhome_1
+    export ORACLE_SID={{ rac_db_name }}
+    export PATH=$ORACLE_HOME/bin:$PATH
+    sqlplus -s / as sysdba <<'EOF'
+    SET HEADING OFF FEEDBACK OFF PAGESIZE 0
+    EXEC DBMS_WORKLOAD_REPOSITORY.CREATE_SNAPSHOT();
+    EXIT;
+    EOF
+  when:
+    - not (_awr_has_explicit_snaps | bool)
+    - _awr_time_snap_count | int < 2
+
+- name: Generate sample workload between snapshots
+  delegate_to: "{{ rac_node_names[0] }}"
+  become: true
+  become_user: oracle
+  ansible.builtin.shell: |
+    export ORACLE_HOME=/u01/app/oracle/product/26ai/dbhome_1
+    export ORACLE_SID={{ rac_db_name }}
+    export PATH=$ORACLE_HOME/bin:$PATH
+    sqlplus -s / as sysdba <<'EOF'
+    SELECT COUNT(*) FROM dba_objects;
+    SELECT COUNT(*) FROM dba_segments;
+    SELECT COUNT(*) FROM dba_tables;
+    ALTER SYSTEM SWITCH LOGFILE;
+    ALTER SYSTEM SWITCH LOGFILE;
+    CREATE TABLE awr_sample_tmp AS SELECT * FROM dba_objects WHERE ROWNUM <= 5000;
+    INSERT INTO awr_sample_tmp SELECT * FROM awr_sample_tmp;
+    COMMIT;
+    DROP TABLE awr_sample_tmp PURGE;
+    EXIT;
+    EOF
+  changed_when: false
+  when:
+    - not (_awr_has_explicit_snaps | bool)
+    - _awr_time_snap_count | int < 2
+
+- name: "Wait for sample period ({{ _awr_wait_secs }}s)"
+  ansible.builtin.pause:
+    seconds: "{{ _awr_wait_secs | int }}"
+  when:
+    - not (_awr_has_explicit_snaps | bool)
+    - _awr_time_snap_count | int < 2
+
+- name: Create END AWR snapshot
+  delegate_to: "{{ rac_node_names[0] }}"
+  become: true
+  become_user: oracle
+  ansible.builtin.shell: |
+    export ORACLE_HOME=/u01/app/oracle/product/26ai/dbhome_1
+    export ORACLE_SID={{ rac_db_name }}
+    export PATH=$ORACLE_HOME/bin:$PATH
+    sqlplus -s / as sysdba <<'EOF'
+    SET HEADING OFF FEEDBACK OFF PAGESIZE 0
+    EXEC DBMS_WORKLOAD_REPOSITORY.CREATE_SNAPSHOT();
+    EXIT;
+    EOF
+  when:
+    - not (_awr_has_explicit_snaps | bool)
+    - _awr_time_snap_count | int < 2
+
+- name: Get latest two snap IDs after creation
+  delegate_to: "{{ rac_node_names[0] }}"
+  become: true
+  become_user: oracle
+  ansible.builtin.shell: |
+    export ORACLE_HOME=/u01/app/oracle/product/26ai/dbhome_1
+    export ORACLE_SID={{ rac_db_name }}
+    export PATH=$ORACLE_HOME/bin:$PATH
+    sqlplus -s / as sysdba <<'EOF'
+    SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 200 TRIMOUT ON TRIMSPOOL ON
+    SELECT 'SNAP_ID=' || snap_id FROM (
+      SELECT snap_id FROM dba_hist_snapshot ORDER BY snap_id DESC
+    ) WHERE ROWNUM <= 2 ORDER BY snap_id;
+    EXIT;
+    EOF
+  register: _awr_fresh_snaps
+  changed_when: false
+  when:
+    - not (_awr_has_explicit_snaps | bool)
+    - _awr_time_snap_count | int < 2
+
+- name: Parse fresh snapshot IDs
+  ansible.builtin.set_fact:
+    _awr_begin_id: "{{ (_awr_fresh_snaps.stdout_lines | select('match', '.*SNAP_ID=') | list)[0].split('=')[1] | trim }}"
+    _awr_end_id: "{{ (_awr_fresh_snaps.stdout_lines | select('match', '.*SNAP_ID=') | list)[1].split('=')[1] | trim }}"
+  when:
+    - not (_awr_has_explicit_snaps | bool)
+    - _awr_time_snap_count | int < 2
+
+# ==================================================================
+# Find the midpoint snap for the AWR Diff report
+# AWR Diff compares period1 (begin→mid) vs period2 (mid→end)
+# ==================================================================
+- name: Find midpoint snapshot for AWR Diff
+  delegate_to: "{{ rac_node_names[0] }}"
+  become: true
+  become_user: oracle
+  ansible.builtin.shell: |
+    export ORACLE_HOME=/u01/app/oracle/product/26ai/dbhome_1
+    export ORACLE_SID={{ rac_db_name }}
+    export PATH=$ORACLE_HOME/bin:$PATH
+    sqlplus -s / as sysdba <<'EOF'
+    SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 200 TRIMOUT ON TRIMSPOOL ON
+    -- Pick the snap closest to the arithmetic midpoint of begin/end snap IDs
+    SELECT 'MID_SNAP=' || snap_id FROM (
+      SELECT snap_id,
+             ABS(snap_id - ROUND(({{ _awr_begin_id }} + {{ _awr_end_id }}) / 2)) AS dist
+      FROM dba_hist_snapshot
+      WHERE snap_id > {{ _awr_begin_id }} AND snap_id < {{ _awr_end_id }}
+      ORDER BY dist ASC, snap_id ASC
+    ) WHERE ROWNUM = 1;
+    SELECT 'TOTAL_SNAPS=' || COUNT(*) FROM dba_hist_snapshot
+    WHERE snap_id >= {{ _awr_begin_id }} AND snap_id <= {{ _awr_end_id }};
+    EXIT;
+    EOF
+  register: _awr_mid_result
+  changed_when: false
+
+- name: Parse midpoint snap and total count
+  ansible.builtin.set_fact:
+    _awr_mid_id: "{{ (_awr_mid_result.stdout_lines | select('match', '.*MID_SNAP=') | list | first | default('MID_SNAP=')).split('=')[1] | default('') | trim }}"
+    _awr_total_snaps: "{{ (_awr_mid_result.stdout_lines | select('match', '.*TOTAL_SNAPS=') | list | first | default('TOTAL_SNAPS=0')).split('=')[1] | trim | int }}"
+
+- name: Set AWR Diff feasibility
+  ansible.builtin.set_fact:
+    _awr_diff_possible: "{{ _awr_mid_id | string | length > 0 and _awr_total_snaps | int >= 3 }}"
+
+- name: Display AWR snapshot range
+  ansible.builtin.debug:
+    msg:
+      - "AWR Report:  snap {{ _awr_begin_id }} → {{ _awr_end_id }} ({{ _awr_total_snaps }} snapshots)"
+      - "AWR Diff:    {{ (_awr_diff_possible | bool) | ternary('Period1 snap ' ~ _awr_begin_id ~ '→' ~ _awr_mid_id ~ ' vs Period2 snap ' ~ _awr_mid_id ~ '→' ~ _awr_end_id, 'Not enough snapshots (need ≥3) — skipping diff report') }}"
+
+# ==================================================================
+# Generate AWR Standard HTML Report
+# ==================================================================
+- name: Generate AWR HTML report on primary
+  delegate_to: "{{ rac_node_names[0] }}"
+  become: true
+  become_user: oracle
+  ansible.builtin.shell: |
+    export ORACLE_HOME=/u01/app/oracle/product/26ai/dbhome_1
+    export ORACLE_SID={{ rac_db_name }}
+    export PATH=$ORACLE_HOME/bin:$PATH
+
+    TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+    REPORT_FILE="/tmp/awr_report_${TIMESTAMP}.html"
+
+    sqlplus -s / as sysdba <<EOF
+    SET LINESIZE 32767
+    SET PAGESIZE 0
+    SET LONG 10000000
+    SET LONGCHUNKSIZE 10000000
+    SET TERMOUT OFF
+    SET FEEDBACK OFF
+    SET VERIFY OFF
+    SET HEADING OFF
+    SET TRIMSPOOL ON
+    SPOOL ${REPORT_FILE}
+
+    SELECT output FROM TABLE(DBMS_WORKLOAD_REPOSITORY.AWR_REPORT_HTML(
+      (SELECT dbid FROM v\$database),
+      (SELECT instance_number FROM v\$instance),
+      {{ _awr_begin_id }},
+      {{ _awr_end_id }}
+    ));
+
+    SPOOL OFF
+    EXIT;
+    EOF
+
+    if [ -s "$REPORT_FILE" ]; then
+      echo "REPORT_PATH=$REPORT_FILE"
+      echo "REPORT_SIZE=$(du -h "$REPORT_FILE" | cut -f1)"
+    else
+      echo "ERROR: AWR report file is empty or missing"
+      exit 1
+    fi
+  register: _awr_generate
+  async: 300
+  poll: 10
+
+- name: Parse AWR report path
+  ansible.builtin.set_fact:
+    _awr_remote_path: "{{ (_awr_generate.stdout_lines | select('match', '^REPORT_PATH=') | first).split('=', 1)[1] }}"
+    _awr_report_size: "{{ (_awr_generate.stdout_lines | select('match', '^REPORT_SIZE=') | first).split('=', 1)[1] }}"
+
+- name: Fetch AWR report from primary
+  delegate_to: "{{ rac_node_names[0] }}"
+  become: true
+  become_user: oracle
+  ansible.builtin.fetch:
+    src: "{{ _awr_remote_path }}"
+    dest: "{{ playbook_dir }}/oracle-rac/{{ _awr_remote_path | basename }}"
+    flat: true
+
+- name: Clean up remote AWR report
+  delegate_to: "{{ rac_node_names[0] }}"
+  become: true
+  become_user: oracle
+  ansible.builtin.file:
+    path: "{{ _awr_remote_path }}"
+    state: absent
+
+# ==================================================================
+# Generate AWR Differential Report (Period1 vs Period2)
+# ==================================================================
+- name: Generate AWR Diff HTML report on primary
+  delegate_to: "{{ rac_node_names[0] }}"
+  become: true
+  become_user: oracle
+  ansible.builtin.shell: |
+    export ORACLE_HOME=/u01/app/oracle/product/26ai/dbhome_1
+    export ORACLE_SID={{ rac_db_name }}
+    export PATH=$ORACLE_HOME/bin:$PATH
+
+    TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+    DIFF_FILE="/tmp/awr_diff_${TIMESTAMP}.html"
+    DBID=$(sqlplus -s / as sysdba <<'EOSQL'
+    SET HEADING OFF FEEDBACK OFF PAGESIZE 0
+    SELECT TRIM(dbid) FROM v$database;
+    EXIT;
+    EOSQL
+    )
+    INST=$(sqlplus -s / as sysdba <<'EOSQL'
+    SET HEADING OFF FEEDBACK OFF PAGESIZE 0
+    SELECT TRIM(instance_number) FROM v$instance;
+    EXIT;
+    EOSQL
+    )
+
+    sqlplus -s / as sysdba <<EOF
+    SET LINESIZE 32767
+    SET PAGESIZE 0
+    SET LONG 10000000
+    SET LONGCHUNKSIZE 10000000
+    SET TERMOUT OFF
+    SET FEEDBACK OFF
+    SET VERIFY OFF
+    SET HEADING OFF
+    SET TRIMSPOOL ON
+    SPOOL ${DIFF_FILE}
+
+    SELECT output FROM TABLE(DBMS_WORKLOAD_REPOSITORY.AWR_DIFF_REPORT_HTML(
+      ${DBID}, ${INST}, {{ _awr_begin_id }}, {{ _awr_mid_id }},
+      ${DBID}, ${INST}, {{ _awr_mid_id }}, {{ _awr_end_id }}
+    ));
+
+    SPOOL OFF
+    EXIT;
+    EOF
+
+    if [ -s "$DIFF_FILE" ]; then
+      echo "DIFF_PATH=$DIFF_FILE"
+      echo "DIFF_SIZE=$(du -h "$DIFF_FILE" | cut -f1)"
+    else
+      echo "ERROR: AWR Diff report file is empty or missing"
+      exit 1
+    fi
+  register: _awr_diff_generate
+  async: 300
+  poll: 10
+  when: _awr_diff_possible | bool
+
+- name: Parse AWR Diff report path
+  ansible.builtin.set_fact:
+    _awr_diff_remote_path: "{{ (_awr_diff_generate.stdout_lines | select('match', '^DIFF_PATH=') | first).split('=', 1)[1] }}"
+    _awr_diff_size: "{{ (_awr_diff_generate.stdout_lines | select('match', '^DIFF_SIZE=') | first).split('=', 1)[1] }}"
+  when: _awr_diff_possible | bool
+
+- name: Fetch AWR Diff report from primary
+  delegate_to: "{{ rac_node_names[0] }}"
+  become: true
+  become_user: oracle
+  ansible.builtin.fetch:
+    src: "{{ _awr_diff_remote_path }}"
+    dest: "{{ playbook_dir }}/oracle-rac/{{ _awr_diff_remote_path | basename }}"
+    flat: true
+  when: _awr_diff_possible | bool
+
+- name: Clean up remote AWR Diff report
+  delegate_to: "{{ rac_node_names[0] }}"
+  become: true
+  become_user: oracle
+  ansible.builtin.file:
+    path: "{{ _awr_diff_remote_path }}"
+    state: absent
+  when: _awr_diff_possible | bool
+
+# ==================================================================
+# Generate ADDM Report (Automatic Database Diagnostic Monitor)
+# ==================================================================
+- name: Generate ADDM report on primary
+  delegate_to: "{{ rac_node_names[0] }}"
+  become: true
+  become_user: oracle
+  ansible.builtin.shell: |
+    export ORACLE_HOME=/u01/app/oracle/product/26ai/dbhome_1
+    export ORACLE_SID={{ rac_db_name }}
+    export PATH=$ORACLE_HOME/bin:$PATH
+
+    TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+    ADDM_FILE="/tmp/addm_report_${TIMESTAMP}.txt"
+    TASK_NAME="ADDM_ANSIBLE_${TIMESTAMP}"
+
+    sqlplus -s / as sysdba <<EOF
+    SET SERVEROUTPUT ON SIZE UNLIMITED
+    SET LINESIZE 32767
+    SET PAGESIZE 0
+    SET LONG 10000000
+    SET LONGCHUNKSIZE 10000000
+    SET FEEDBACK OFF
+    SET VERIFY OFF
+    SET HEADING OFF
+    SET TRIMSPOOL ON
+
+    -- Create and execute ADDM task
+    DECLARE
+      v_task_name VARCHAR2(100) := '${TASK_NAME}';
+      v_task_desc VARCHAR2(256) := 'ADDM analysis snap {{ _awr_begin_id }} to {{ _awr_end_id }}';
+      v_dbid      NUMBER;
+      v_inst      NUMBER;
+    BEGIN
+      SELECT dbid INTO v_dbid FROM v\$database;
+      SELECT instance_number INTO v_inst FROM v\$instance;
+      DBMS_ADVISOR.CREATE_TASK('ADDM', v_task_name, v_task_desc);
+      DBMS_ADVISOR.SET_TASK_PARAMETER(v_task_name, 'START_SNAPSHOT', {{ _awr_begin_id }});
+      DBMS_ADVISOR.SET_TASK_PARAMETER(v_task_name, 'END_SNAPSHOT',   {{ _awr_end_id }});
+      DBMS_ADVISOR.SET_TASK_PARAMETER(v_task_name, 'INSTANCE',       v_inst);
+      DBMS_ADVISOR.SET_TASK_PARAMETER(v_task_name, 'DB_ID',          v_dbid);
+      DBMS_ADVISOR.EXECUTE_TASK(v_task_name);
+    END;
+    /
+
+    -- Spool the TEXT report (ADDM does not support HTML)
+    SPOOL ${ADDM_FILE}
+    SELECT DBMS_ADVISOR.GET_TASK_REPORT('${TASK_NAME}', 'TEXT', 'ALL') FROM dual;
+    SPOOL OFF
+
+    -- Clean up the advisor task
+    EXEC DBMS_ADVISOR.DELETE_TASK('${TASK_NAME}');
+    EXIT;
+    EOF
+
+    if [ -s "$ADDM_FILE" ]; then
+      echo "ADDM_PATH=$ADDM_FILE"
+      echo "ADDM_SIZE=$(du -h "$ADDM_FILE" | cut -f1)"
+    else
+      echo "ERROR: ADDM report file is empty or missing"
+      exit 1
+    fi
+  register: _addm_generate
+  async: 300
+  poll: 10
+
+- name: Parse ADDM report path
+  ansible.builtin.set_fact:
+    _addm_remote_path: "{{ (_addm_generate.stdout_lines | select('match', '^ADDM_PATH=') | first).split('=', 1)[1] }}"
+    _addm_size: "{{ (_addm_generate.stdout_lines | select('match', '^ADDM_SIZE=') | first).split('=', 1)[1] }}"
+
+- name: Fetch ADDM report from primary
+  delegate_to: "{{ rac_node_names[0] }}"
+  become: true
+  become_user: oracle
+  ansible.builtin.fetch:
+    src: "{{ _addm_remote_path }}"
+    dest: "{{ playbook_dir }}/oracle-rac/{{ _addm_remote_path | basename }}"
+    flat: true
+
+- name: Clean up remote ADDM report
+  delegate_to: "{{ rac_node_names[0] }}"
+  become: true
+  become_user: oracle
+  ansible.builtin.file:
+    path: "{{ _addm_remote_path }}"
+    state: absent
+
+# ==================================================================
+# Generate ASH Report (Active Session History)
+# ==================================================================
+- name: Generate ASH HTML report on primary
+  delegate_to: "{{ rac_node_names[0] }}"
+  become: true
+  become_user: oracle
+  ansible.builtin.shell: |
+    export ORACLE_HOME=/u01/app/oracle/product/26ai/dbhome_1
+    export ORACLE_SID={{ rac_db_name }}
+    export PATH=$ORACLE_HOME/bin:$PATH
+
+    TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+    ASH_FILE="/tmp/ash_report_${TIMESTAMP}.html"
+
+    sqlplus -s / as sysdba <<EOF
+    SET LINESIZE 32767
+    SET PAGESIZE 0
+    SET LONG 10000000
+    SET LONGCHUNKSIZE 10000000
+    SET TERMOUT OFF
+    SET FEEDBACK OFF
+    SET VERIFY OFF
+    SET HEADING OFF
+    SET TRIMSPOOL ON
+    SPOOL ${ASH_FILE}
+
+    SELECT output FROM TABLE(DBMS_WORKLOAD_REPOSITORY.ASH_REPORT_HTML(
+      (SELECT dbid FROM v\$database),
+      (SELECT instance_number FROM v\$instance),
+      (SELECT begin_interval_time FROM dba_hist_snapshot WHERE snap_id = {{ _awr_begin_id }}),
+      (SELECT end_interval_time   FROM dba_hist_snapshot WHERE snap_id = {{ _awr_end_id }})
+    ));
+
+    SPOOL OFF
+    EXIT;
+    EOF
+
+    if [ -s "$ASH_FILE" ]; then
+      echo "ASH_PATH=$ASH_FILE"
+      echo "ASH_SIZE=$(du -h "$ASH_FILE" | cut -f1)"
+    else
+      echo "ERROR: ASH report file is empty or missing"
+      exit 1
+    fi
+  register: _ash_generate
+  async: 300
+  poll: 10
+
+- name: Parse ASH report path
+  ansible.builtin.set_fact:
+    _ash_remote_path: "{{ (_ash_generate.stdout_lines | select('match', '^ASH_PATH=') | first).split('=', 1)[1] }}"
+    _ash_size: "{{ (_ash_generate.stdout_lines | select('match', '^ASH_SIZE=') | first).split('=', 1)[1] }}"
+
+- name: Fetch ASH report from primary
+  delegate_to: "{{ rac_node_names[0] }}"
+  become: true
+  become_user: oracle
+  ansible.builtin.fetch:
+    src: "{{ _ash_remote_path }}"
+    dest: "{{ playbook_dir }}/oracle-rac/{{ _ash_remote_path | basename }}"
+    flat: true
+
+- name: Clean up remote ASH report
+  delegate_to: "{{ rac_node_names[0] }}"
+  become: true
+  become_user: oracle
+  ansible.builtin.file:
+    path: "{{ _ash_remote_path }}"
+    state: absent
+
+# ==================================================================
+# Generate SQL Monitor Report
+# ==================================================================
+- name: Generate SQL Monitor report on primary
+  delegate_to: "{{ rac_node_names[0] }}"
+  become: true
+  become_user: oracle
+  ansible.builtin.shell: |
+    export ORACLE_HOME=/u01/app/oracle/product/26ai/dbhome_1
+    export ORACLE_SID={{ rac_db_name }}
+    export PATH=$ORACLE_HOME/bin:$PATH
+
+    TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+    SQLMON_FILE="/tmp/sqlmon_report_${TIMESTAMP}.html"
+
+    sqlplus -s / as sysdba <<EOF
+    SET LINESIZE 32767
+    SET PAGESIZE 0
+    SET LONG 10000000
+    SET LONGCHUNKSIZE 10000000
+    SET TERMOUT OFF
+    SET FEEDBACK OFF
+    SET VERIFY OFF
+    SET HEADING OFF
+    SET TRIMSPOOL ON
+    SPOOL ${SQLMON_FILE}
+
+    SELECT DBMS_SQL_MONITOR.REPORT_SQL_MONITOR_LIST(
+      report_level => 'ALL',
+      type => 'HTML'
+    ) FROM dual;
+
+    SPOOL OFF
+    EXIT;
+    EOF
+
+    if [ -s "$SQLMON_FILE" ]; then
+      echo "SQLMON_PATH=$SQLMON_FILE"
+      echo "SQLMON_SIZE=$(du -h "$SQLMON_FILE" | cut -f1)"
+    else
+      echo "SQLMON_PATH="
+      echo "SQLMON_SIZE=0"
+    fi
+  register: _sqlmon_generate
+  async: 120
+  poll: 10
+  failed_when: false
+
+- name: Parse SQL Monitor report path
+  ansible.builtin.set_fact:
+    _sqlmon_remote_path: "{{ (_sqlmon_generate.stdout_lines | select('match', '^SQLMON_PATH=') | first | default('SQLMON_PATH=')).split('=', 1)[1] | default('') | trim }}"
+    _sqlmon_size: "{{ (_sqlmon_generate.stdout_lines | select('match', '^SQLMON_SIZE=') | first | default('SQLMON_SIZE=0')).split('=', 1)[1] | default('0') | trim }}"
+  when: _sqlmon_generate is not failed
+
+- name: Set SQL Monitor defaults on failure
+  ansible.builtin.set_fact:
+    _sqlmon_remote_path: ""
+    _sqlmon_size: "0"
+  when: _sqlmon_generate is failed or _sqlmon_remote_path is not defined
+
+- name: Fetch SQL Monitor report from primary
+  delegate_to: "{{ rac_node_names[0] }}"
+  become: true
+  become_user: oracle
+  ansible.builtin.fetch:
+    src: "{{ _sqlmon_remote_path }}"
+    dest: "{{ playbook_dir }}/oracle-rac/{{ _sqlmon_remote_path | basename }}"
+    flat: true
+  when: _sqlmon_remote_path | length > 0
+
+- name: Clean up remote SQL Monitor report
+  delegate_to: "{{ rac_node_names[0] }}"
+  become: true
+  become_user: oracle
+  ansible.builtin.file:
+    path: "{{ _sqlmon_remote_path }}"
+    state: absent
+  when: _sqlmon_remote_path | length > 0
+
+# ==================================================================
+# Generate SQL Tuning Advisor Report (top SQL from AWR period)
+# ==================================================================
+- name: Get top SQL_ID from AWR period for tuning
+  delegate_to: "{{ rac_node_names[0] }}"
+  become: true
+  become_user: oracle
+  ansible.builtin.shell: |
+    export ORACLE_HOME=/u01/app/oracle/product/26ai/dbhome_1
+    export ORACLE_SID={{ rac_db_name }}
+    export PATH=$ORACLE_HOME/bin:$PATH
+    sqlplus -s / as sysdba <<'EOF'
+    SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 200 TRIMOUT ON TRIMSPOOL ON
+    SELECT 'TOP_SQL=' || sql_id FROM (
+      SELECT sql_id FROM dba_hist_sqlstat
+      WHERE snap_id BETWEEN {{ _awr_begin_id }} AND {{ _awr_end_id }}
+        AND parsing_schema_name NOT IN ('SYS','SYSTEM','DBSNMP','AUDSYS','MDSYS')
+      ORDER BY elapsed_time_delta DESC
+    ) WHERE ROWNUM <= 5;
+    EXIT;
+    EOF
+  register: _sqltune_top_sql
+  changed_when: false
+
+- name: Parse top SQL IDs
+  ansible.builtin.set_fact:
+    _sqltune_sql_ids: "{{ _sqltune_top_sql.stdout_lines | select('match', '.*TOP_SQL=') | map('regex_replace', '.*TOP_SQL=(.*)$', '\\1') | map('trim') | list }}"
+
+- name: Generate SQL Tuning Advisor report on primary
+  delegate_to: "{{ rac_node_names[0] }}"
+  become: true
+  become_user: oracle
+  ansible.builtin.shell: |
+    export ORACLE_HOME=/u01/app/oracle/product/26ai/dbhome_1
+    export ORACLE_SID={{ rac_db_name }}
+    export PATH=$ORACLE_HOME/bin:$PATH
+
+    TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+    SQLTUNE_FILE="/tmp/sqltune_report_${TIMESTAMP}.txt"
+    TASK_NAME="SQLTUNE_ANSIBLE_${TIMESTAMP}"
+
+    sqlplus -s / as sysdba <<EOF
+    SET SERVEROUTPUT ON SIZE UNLIMITED
+    SET LONG 10000000
+    SET LONGCHUNKSIZE 10000000
+    SET LINESIZE 32767
+    SET PAGESIZE 0
+    SET FEEDBACK OFF
+    SET VERIFY OFF
+    SET HEADING OFF
+    SET TRIMSPOOL ON
+
+    DECLARE
+      v_task VARCHAR2(100) := '${TASK_NAME}';
+      v_sqlset VARCHAR2(100);
+    BEGIN
+      -- Create tuning task with the top SQL statements
+      DBMS_SQLTUNE.CREATE_TUNING_TASK(
+        begin_snap    => {{ _awr_begin_id }},
+        end_snap      => {{ _awr_end_id }},
+        task_name     => v_task,
+        description   => 'Auto tuning snap {{ _awr_begin_id }} to {{ _awr_end_id }}',
+        scope         => DBMS_SQLTUNE.SCOPE_COMPREHENSIVE,
+        time_limit    => 120
+      );
+      DBMS_SQLTUNE.EXECUTE_TUNING_TASK(v_task);
+    END;
+    /
+
+    SPOOL ${SQLTUNE_FILE}
+    SELECT DBMS_SQLTUNE.REPORT_TUNING_TASK('${TASK_NAME}', 'TEXT', 'ALL', 'ALL') FROM dual;
+    SPOOL OFF
+
+    EXEC DBMS_SQLTUNE.DROP_TUNING_TASK('${TASK_NAME}');
+    EXIT;
+    EOF
+
+    if [ -s "$SQLTUNE_FILE" ]; then
+      echo "SQLTUNE_PATH=$SQLTUNE_FILE"
+      echo "SQLTUNE_SIZE=$(du -h "$SQLTUNE_FILE" | cut -f1)"
+    else
+      echo "SQLTUNE_PATH="
+      echo "SQLTUNE_SIZE=0"
+    fi
+  register: _sqltune_generate
+  async: 300
+  poll: 10
+  when: _sqltune_sql_ids | length > 0
+  failed_when: false
+
+- name: Parse SQL Tuning report path
+  ansible.builtin.set_fact:
+    _sqltune_remote_path: "{{ (_sqltune_generate.stdout_lines | select('match', '^SQLTUNE_PATH=') | first | default('SQLTUNE_PATH=')).split('=', 1)[1] | default('') | trim }}"
+    _sqltune_size: "{{ (_sqltune_generate.stdout_lines | select('match', '^SQLTUNE_SIZE=') | first | default('SQLTUNE_SIZE=0')).split('=', 1)[1] | default('0') | trim }}"
+  when: _sqltune_generate is defined and _sqltune_generate is not skipped and _sqltune_generate is not failed
+
+- name: Set SQL Tuning defaults
+  ansible.builtin.set_fact:
+    _sqltune_remote_path: ""
+    _sqltune_size: "0"
+  when: _sqltune_remote_path is not defined
+
+- name: Fetch SQL Tuning report from primary
+  delegate_to: "{{ rac_node_names[0] }}"
+  become: true
+  become_user: oracle
+  ansible.builtin.fetch:
+    src: "{{ _sqltune_remote_path }}"
+    dest: "{{ playbook_dir }}/oracle-rac/{{ _sqltune_remote_path | basename }}"
+    flat: true
+  when: _sqltune_remote_path | length > 0
+
+- name: Clean up remote SQL Tuning report
+  delegate_to: "{{ rac_node_names[0] }}"
+  become: true
+  become_user: oracle
+  ansible.builtin.file:
+    path: "{{ _sqltune_remote_path }}"
+    state: absent
+  when: _sqltune_remote_path | length > 0
+
+# ==================================================================
+# Generate Health Monitor Report
+# ==================================================================
+- name: Generate Health Monitor report on primary
+  delegate_to: "{{ rac_node_names[0] }}"
+  become: true
+  become_user: oracle
+  ansible.builtin.shell: |
+    export ORACLE_HOME=/u01/app/oracle/product/26ai/dbhome_1
+    export ORACLE_SID={{ rac_db_name }}
+    export PATH=$ORACLE_HOME/bin:$PATH
+
+    TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+    HM_FILE="/tmp/healthmon_report_${TIMESTAMP}.html"
+
+    sqlplus -s / as sysdba <<'EOF'
+    SET SERVEROUTPUT ON SIZE UNLIMITED
+    SET LINESIZE 32767
+    SET PAGESIZE 0
+    SET LONG 10000000
+    SET LONGCHUNKSIZE 10000000
+    SET FEEDBACK OFF
+    SET VERIFY OFF
+    SET HEADING OFF
+    SET TRIMSPOOL ON
+
+    -- Run the Dictionary Integrity check
+    BEGIN
+      DBMS_HM.RUN_CHECK('Dictionary Integrity Check', 'HM_DICT_ANSIBLE');
+    EXCEPTION WHEN OTHERS THEN
+      -- Task may already exist from a prior run
+      IF SQLCODE = -36503 THEN NULL; ELSE RAISE; END IF;
+    END;
+    /
+
+    SPOOL /tmp/healthmon_report_PLACEHOLDER.html
+    SELECT DBMS_HM.GET_RUN_REPORT('HM_DICT_ANSIBLE', 'HTML', 'DETAIL') FROM dual;
+    SPOOL OFF
+    EXIT;
+    EOF
+
+    # Rename placeholder to actual timestamp
+    mv /tmp/healthmon_report_PLACEHOLDER.html "$HM_FILE" 2>/dev/null || true
+
+    if [ -s "$HM_FILE" ]; then
+      echo "HM_PATH=$HM_FILE"
+      echo "HM_SIZE=$(du -h "$HM_FILE" | cut -f1)"
+    else
+      echo "HM_PATH="
+      echo "HM_SIZE=0"
+    fi
+  register: _hm_generate
+  async: 120
+  poll: 10
+  failed_when: false
+
+- name: Parse Health Monitor report path
+  ansible.builtin.set_fact:
+    _hm_remote_path: "{{ (_hm_generate.stdout_lines | select('match', '^HM_PATH=') | first | default('HM_PATH=')).split('=', 1)[1] | default('') | trim }}"
+    _hm_size: "{{ (_hm_generate.stdout_lines | select('match', '^HM_SIZE=') | first | default('HM_SIZE=0')).split('=', 1)[1] | default('0') | trim }}"
+  when: _hm_generate is not failed
+
+- name: Set Health Monitor defaults on failure
+  ansible.builtin.set_fact:
+    _hm_remote_path: ""
+    _hm_size: "0"
+  when: _hm_generate is failed or _hm_remote_path is not defined
+
+- name: Fetch Health Monitor report from primary
+  delegate_to: "{{ rac_node_names[0] }}"
+  become: true
+  become_user: oracle
+  ansible.builtin.fetch:
+    src: "{{ _hm_remote_path }}"
+    dest: "{{ playbook_dir }}/oracle-rac/{{ _hm_remote_path | basename }}"
+    flat: true
+  when: _hm_remote_path | length > 0
+
+- name: Clean up remote Health Monitor report
+  delegate_to: "{{ rac_node_names[0] }}"
+  become: true
+  become_user: oracle
+  ansible.builtin.file:
+    path: "{{ _hm_remote_path }}"
+    state: absent
+  when: _hm_remote_path | length > 0
+
+# ==================================================================
+# Summary
+# ==================================================================
+- name: Display key AWR metrics from database
+  delegate_to: "{{ rac_node_names[0] }}"
+  become: true
+  become_user: oracle
+  ansible.builtin.shell: |
+    export ORACLE_HOME=/u01/app/oracle/product/26ai/dbhome_1
+    export ORACLE_SID={{ rac_db_name }}
+    export PATH=$ORACLE_HOME/bin:$PATH
+    sqlplus -s / as sysdba <<'EOF'
+    SET LINESIZE 200
+    SET PAGESIZE 50
+    PROMPT ====== Instance Info ======
+    SELECT instance_name, host_name, status, TO_CHAR(startup_time,'YYYY-MM-DD HH24:MI') AS started FROM v$instance;
+
+    PROMPT ====== Database Info ======
+    SELECT name, db_unique_name, open_mode, database_role, protection_mode FROM v$database;
+
+    PROMPT ====== SGA/PGA ======
+    SHOW PARAMETER sga_target;
+    SHOW PARAMETER pga_aggregate_target;
+
+    PROMPT ====== Tablespace Usage ======
+    COL tablespace_name FORMAT A25
+    COL size_mb FORMAT 999999.99
+    COL pct_used FORMAT 999.9
+    SELECT t.tablespace_name,
+           ROUND(t.bytes/1024/1024,2) AS size_mb,
+           ROUND((t.bytes - NVL(f.bytes,0))/t.bytes*100,1) AS pct_used
+    FROM (SELECT tablespace_name, SUM(bytes) bytes FROM dba_data_files GROUP BY tablespace_name) t
+    LEFT JOIN (SELECT tablespace_name, SUM(bytes) bytes FROM dba_free_space GROUP BY tablespace_name) f
+      ON t.tablespace_name = f.tablespace_name
+    ORDER BY pct_used DESC;
+
+    PROMPT ====== Top Wait Events (last snapshot) ======
+    COL event_name FORMAT A45
+    COL wait_class FORMAT A15
+    SELECT * FROM (
+      SELECT event_name, wait_class, total_waits, ROUND(time_waited_micro/1000000,2) AS time_sec
+      FROM dba_hist_system_event
+      WHERE snap_id = {{ _awr_end_id }}
+        AND wait_class != 'Idle'
+      ORDER BY time_waited_micro DESC
+    ) WHERE ROWNUM <= 10;
+
+    PROMPT ====== Instance Efficiency ======
+    SELECT ROUND(
+      (SELECT SUM(value) FROM v$sysstat WHERE name = 'consistent gets') /
+      NULLIF((SELECT SUM(value) FROM v$sysstat WHERE name IN ('consistent gets','physical reads')),0) * 100, 2
+    ) AS buffer_cache_hit_pct FROM dual;
+
+    PROMPT ====== Blocked Sessions (current) ======
+    COL blocking_session FORMAT 999999
+    COL blocked_session FORMAT 999999
+    COL blocked_sql FORMAT A50
+    COL wait_event FORMAT A35
+    COL wait_secs FORMAT 99999
+    SELECT w.blocking_session,
+           w.sid AS blocked_session,
+           SUBSTR(s.sql_id || ' - ' || SUBSTR(q.sql_text,1,40),1,50) AS blocked_sql,
+           w.event AS wait_event,
+           w.seconds_in_wait AS wait_secs
+    FROM v$session w
+    JOIN v$session s ON w.sid = s.sid
+    LEFT JOIN v$sql q ON s.sql_id = q.sql_id AND ROWNUM <= 1
+    WHERE w.blocking_session IS NOT NULL
+    ORDER BY w.seconds_in_wait DESC;
+
+    PROMPT ====== Long Running SQL (active > 5s) ======
+    COL sid_serial FORMAT A12
+    COL sql_id FORMAT A15
+    COL elapsed_sec FORMAT 999999.9
+    COL sql_text_short FORMAT A60
+    SELECT s.sid || ',' || s.serial# AS sid_serial,
+           s.sql_id,
+           ROUND(s.last_call_et,1) AS elapsed_sec,
+           SUBSTR(q.sql_text,1,60) AS sql_text_short
+    FROM v$session s
+    LEFT JOIN v$sql q ON s.sql_id = q.sql_id AND q.child_number = 0
+    WHERE s.status = 'ACTIVE'
+      AND s.type = 'USER'
+      AND s.last_call_et > 5
+      AND s.sql_id IS NOT NULL
+    ORDER BY s.last_call_et DESC
+    FETCH FIRST 10 ROWS ONLY;
+
+    PROMPT ====== Top SQL by Elapsed Time (AWR) ======
+    COL sql_id FORMAT A15
+    COL elapsed_sec FORMAT 999999.9
+    COL executions FORMAT 999999999
+    COL avg_sec FORMAT 99999.99
+    COL sql_text_short FORMAT A55
+    SELECT * FROM (
+      SELECT s.sql_id,
+             ROUND(s.elapsed_time_delta/1000000,1) AS elapsed_sec,
+             s.executions_delta AS executions,
+             ROUND(CASE WHEN s.executions_delta > 0
+                        THEN s.elapsed_time_delta/s.executions_delta/1000000
+                        ELSE 0 END, 2) AS avg_sec,
+             SUBSTR(t.sql_text,1,55) AS sql_text_short
+      FROM dba_hist_sqlstat s
+      JOIN dba_hist_sqltext t ON s.sql_id = t.sql_id AND s.dbid = t.dbid
+      WHERE s.snap_id = {{ _awr_end_id }}
+      ORDER BY s.elapsed_time_delta DESC
+    ) WHERE ROWNUM <= 10;
+    EXIT;
+    EOF
+  register: _awr_summary
+  changed_when: false
+
+- name: Display diagnostic summary
+  ansible.builtin.debug:
+    msg:
+      - "====== Reports Generated ======"
+      - "  1. AWR Report:      snap {{ _awr_begin_id }} → {{ _awr_end_id }} ({{ _awr_report_size }})"
+      - "     → oracle-rac/{{ _awr_remote_path | basename }}"
+      - "  2. AWR Diff:        {{ (_awr_diff_possible | bool) | ternary('Period1 ' ~ _awr_begin_id ~ '→' ~ _awr_mid_id ~ ' vs Period2 ' ~ _awr_mid_id ~ '→' ~ _awr_end_id ~ ' (' ~ (_awr_diff_size | default('N/A')) ~ ')', 'Skipped (< 3 snapshots)') }}"
+      - "     {{ (_awr_diff_possible | bool) | ternary('→ oracle-rac/' ~ (_awr_diff_remote_path | default('/tmp/none') | basename), '') }}"
+      - "  3. ADDM Report:     snap {{ _awr_begin_id }} → {{ _awr_end_id }} ({{ _addm_size }})"
+      - "     → oracle-rac/{{ _addm_remote_path | basename }}"
+      - "  4. ASH Report:      snap {{ _awr_begin_id }} → {{ _awr_end_id }} ({{ _ash_size }})"
+      - "     → oracle-rac/{{ _ash_remote_path | basename }}"
+      - "  5. SQL Monitor:     {{ (_sqlmon_remote_path | length > 0) | ternary(_sqlmon_size, 'No monitored SQL found') }}"
+      - "     {{ (_sqlmon_remote_path | length > 0) | ternary('→ oracle-rac/' ~ (_sqlmon_remote_path | basename), '') }}"
+      - "  6. SQL Tuning:      {{ (_sqltune_remote_path | length > 0) | ternary(_sqltune_size ~ ' (' ~ (_sqltune_sql_ids | default([]) | length) ~ ' SQL analyzed)', 'No user SQL to tune') }}"
+      - "     {{ (_sqltune_remote_path | length > 0) | ternary('→ oracle-rac/' ~ (_sqltune_remote_path | basename), '') }}"
+      - "  7. Health Monitor:  {{ (_hm_remote_path | length > 0) | ternary(_hm_size ~ ' (Dictionary Integrity)', 'Check unavailable') }}"
+      - "     {{ (_hm_remote_path | length > 0) | ternary('→ oracle-rac/' ~ (_hm_remote_path | basename), '') }}"
+      - ""
+      - "{{ _awr_summary.stdout_lines }}"
