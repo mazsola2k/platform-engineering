@@ -665,6 +665,39 @@
   changed_when: false
 
 # ==================================================================
+# Clean up stale standby from previous runs (must run BEFORE password copy)
+# ==================================================================
+- name: Clean up stale standby on re-run (spfile, ASM datafiles, prevents ORA-15041/RMAN-05537)
+  delegate_to: "{{ rac_standby_name }}"
+  become: true
+  become_user: root
+  ansible.builtin.shell: |
+    DB_HOME=/u01/app/oracle/product/26ai/dbhome_1
+    GI_HOME=/u01/app/26ai/grid
+
+    # Shut down DB instance if running (previous failed RMAN may have left it up)
+    su - oracle -c "export ORACLE_HOME=$DB_HOME; export ORACLE_SID={{ rac_db_name }}; \
+      printf 'SHUTDOWN ABORT;\nEXIT;\n' | $DB_HOME/bin/sqlplus -s / as sysdba" 2>/dev/null || true
+
+    # Remove stale spfile from filesystem (password file will be re-copied next)
+    rm -f $DB_HOME/dbs/spfile{{ rac_db_name }}.ora
+
+    # Clean old standby files from ASM (prevents diskgroup space exhaustion)
+    su - grid -c "export ORACLE_HOME=$GI_HOME; export ORACLE_SID=+ASM; \
+      $GI_HOME/bin/asmcmd ls +DATA/{{ rac_db_name }}_STDBY/ 2>/dev/null" && \
+      su - grid -c "export ORACLE_HOME=$GI_HOME; export ORACLE_SID=+ASM; \
+        $GI_HOME/bin/asmcmd rm -rf +DATA/{{ rac_db_name }}_STDBY/" 2>/dev/null && \
+        echo "Cleaned +DATA/{{ rac_db_name }}_STDBY/"
+    su - grid -c "export ORACLE_HOME=$GI_HOME; export ORACLE_SID=+ASM; \
+      $GI_HOME/bin/asmcmd ls +FRA/{{ rac_db_name }}_STDBY/ 2>/dev/null" && \
+      su - grid -c "export ORACLE_HOME=$GI_HOME; export ORACLE_SID=+ASM; \
+        $GI_HOME/bin/asmcmd rm -rf +FRA/{{ rac_db_name }}_STDBY/" 2>/dev/null && \
+        echo "Cleaned +FRA/{{ rac_db_name }}_STDBY/"
+    echo "Standby cleanup complete"
+  failed_when: false
+  changed_when: false
+
+# ==================================================================
 # Password file (needed before RMAN connect)
 # ==================================================================
 - name: Fetch password file from primary
@@ -704,33 +737,78 @@
       db_recovery_file_dest=+FRA
       db_recovery_file_dest_size=8G
 
-- name: Clean up stale spfile on standby (prevents RMAN-05537 on re-run)
-  delegate_to: "{{ rac_standby_name }}"
-  become: true
-  become_user: oracle
-  ansible.builtin.shell: |
-    export ORACLE_HOME=/u01/app/oracle/product/26ai/dbhome_1
-    export ORACLE_SID={{ rac_db_name }}
-    export PATH=$ORACLE_HOME/bin:$PATH
-    # Shut down if running (previous failed RMAN may have left it up)
-    sqlplus -s / as sysdba <<EOF
-    SHUTDOWN ABORT;
-    EXIT;
-    EOF
-    # Remove stale spfile — RMAN DUPLICATE needs a clean pfile start
-    rm -f $ORACLE_HOME/dbs/spfile{{ rac_db_name }}.ora
-    rm -f +DATA/{{ rac_db_name }}_STDBY/spfile{{ rac_db_name }}.ora 2>/dev/null || true
-  failed_when: false
-  changed_when: false
-
 - name: Fix Grid home oracle binary permissions on standby (setuid for ASM access)
   delegate_to: "{{ rac_standby_name }}"
   ansible.builtin.file:
     path: /u01/app/26ai/grid/bin/oracle
     owner: grid
-    group: asmadmin
+    group: oinstall
     mode: '6751'
+  register: grid_binary_fix
   failed_when: false
+
+- name: Restart ASM if Grid binary permissions were changed (SGA group must match)
+  delegate_to: "{{ rac_standby_name }}"
+  ansible.builtin.shell: |
+    GI_HOME=/u01/app/26ai/grid
+    echo "Grid binary permissions changed — restarting HAS so ASM SGA inherits new group"
+    $GI_HOME/bin/crsctl stop has -f 2>&1 || true
+    sleep 5
+    pkill -9 -u grid 2>/dev/null || true
+    sleep 3
+    ipcs -m | awk '/grid|54331/ {print $2}' | xargs -I{} ipcrm -m {} 2>/dev/null || true
+    $GI_HOME/bin/crsctl start has 2>&1
+    # Wait for ASM to be fully online
+    for i in $(seq 1 30); do
+      RESULT=$(su - grid -c "export ORACLE_HOME=$GI_HOME; export ORACLE_SID=+ASM; echo 'SELECT status FROM v\$instance;' | $GI_HOME/bin/sqlplus -s / as sysasm" 2>&1)
+      if echo "$RESULT" | grep -q "STARTED"; then
+        echo "ASM restarted with correct SGA permissions"
+        sleep 10
+        exit 0
+      fi
+      sleep 2
+    done
+    echo "WARNING: ASM slow to start after restart"
+    exit 0
+  when: grid_binary_fix is changed
+  changed_when: true
+
+- name: Verify ASM is healthy on standby before RMAN (restart if stuck)
+  delegate_to: "{{ rac_standby_name }}"
+  ansible.builtin.shell: |
+    GI_HOME=/u01/app/26ai/grid
+
+    # Test ASM connectivity from grid user
+    RESULT=$(su - grid -c "export ORACLE_HOME=$GI_HOME; export ORACLE_SID=+ASM; echo 'SELECT status FROM v\$instance;' | $GI_HOME/bin/sqlplus -s / as sysasm" 2>&1)
+
+    if echo "$RESULT" | grep -q "STARTED"; then
+      echo "ASM is healthy"
+      exit 0
+    fi
+
+    echo "ASM not responsive — restarting HAS"
+    pkill -9 -u grid 2>/dev/null || true
+    sleep 3
+    # Clean orphan SHM segments
+    ipcs -m | awk '/grid/ {print $2}' | xargs -I{} ipcrm -m {} 2>/dev/null || true
+    $GI_HOME/bin/crsctl start has 2>&1 || true
+
+    # Wait for ASM to come back
+    for i in $(seq 1 30); do
+      RESULT2=$(su - grid -c "export ORACLE_HOME=$GI_HOME; export ORACLE_SID=+ASM; echo 'SELECT status FROM v\$instance;' | $GI_HOME/bin/sqlplus -s / as sysasm" 2>&1)
+      if echo "$RESULT2" | grep -q "STARTED"; then
+        echo "ASM recovered after restart"
+        # Wait for disk groups to mount
+        sleep 10
+        exit 0
+      fi
+      sleep 2
+    done
+    echo "ERROR: ASM did not recover"
+    exit 1
+  changed_when: false
+  async: 120
+  poll: 10
 
 - name: Start standby instance in NOMOUNT
   delegate_to: "{{ rac_standby_name }}"

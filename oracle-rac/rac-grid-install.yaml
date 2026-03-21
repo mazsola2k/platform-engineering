@@ -238,6 +238,17 @@
   poll: 30
 
 # ---- Run root.sh on all nodes ----
+- name: Fix Grid home oracle binary permissions BEFORE root.sh (setuid/setgid oinstall)
+  delegate_to: "{{ item }}"
+  ansible.builtin.file:
+    path: /u01/app/26ai/grid/bin/oracle
+    owner: grid
+    group: oinstall
+    mode: '6751'
+  loop: "{{ rac_node_names }}"
+  when: not gi_installed_check.stat.exists
+  failed_when: false
+
 - name: Run orainstRoot.sh on all nodes
   delegate_to: "{{ item }}"
   ansible.builtin.command: /u01/app/oraInventory/orainstRoot.sh
@@ -280,7 +291,6 @@
     group: oinstall
     mode: '6751'
   loop: "{{ rac_node_names }}"
-  when: css_check.stdout | default('') == 'OFFLINE'
   failed_when: false
 
 - name: Fix hostname resolution to use L2 IPs

@@ -48,6 +48,46 @@
     fi
   become: true
 
+- name: Ensure Calico CNI kubeconfig has fresh token and real API server
+  ansible.builtin.shell: |
+    KUBECONFIG_FILE=/etc/cni/net.d/calico-kubeconfig
+    API_SERVER=$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}')
+    NEEDS_RESTART=false
+
+    if [ -f "$KUBECONFIG_FILE" ]; then
+      # Check if Calico token is expired
+      TOKEN=$(grep -oP 'token: \K\S+' "$KUBECONFIG_FILE" | tr -d '"')
+      if [ -n "$TOKEN" ]; then
+        # Decode JWT payload and check exp
+        EXP=$(echo "$TOKEN" | cut -d. -f2 | base64 -d 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('exp',0))" 2>/dev/null || echo 0)
+        NOW=$(date +%s)
+        if [ "$EXP" -lt "$NOW" ] 2>/dev/null; then
+          echo "Calico token expired (exp=$EXP, now=$NOW), restarting calico-node"
+          NEEDS_RESTART=true
+        fi
+      fi
+    fi
+
+    # Restart calico-node to regenerate kubeconfig with fresh token if needed
+    if [ "$NEEDS_RESTART" = "true" ]; then
+      CALICO_POD=$(kubectl -n kube-system get pods -l k8s-app=calico-node -o name 2>/dev/null | head -1)
+      if [ -n "$CALICO_POD" ]; then
+        kubectl -n kube-system delete "$CALICO_POD" --wait=true --timeout=60s
+        kubectl -n kube-system wait --for=condition=ready pod -l k8s-app=calico-node --timeout=120s
+        echo "calico-node restarted"
+        sleep 5
+      fi
+    fi
+
+    # Fix server URL if pointing to cluster-IP
+    if [ -f "$KUBECONFIG_FILE" ] && grep -q "10.96.0.1" "$KUBECONFIG_FILE" 2>/dev/null; then
+      sed -i "s|server: https://10.96.0.1:443|server: $API_SERVER|" "$KUBECONFIG_FILE"
+      echo "Fixed Calico kubeconfig: cluster-IP -> $API_SERVER"
+    else
+      echo "Calico kubeconfig already uses real API endpoint"
+    fi
+  become: true
+
 - name: Ensure Multus CNI binary is in kubelet CNI path
   ansible.builtin.shell: |
     # Multus installs to /opt/cni/bin/ but kubelet may use /usr/libexec/cni/

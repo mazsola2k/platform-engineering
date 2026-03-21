@@ -21,6 +21,14 @@
   register: obs_pv_check
   failed_when: false
 
+- name: "{{ rac_observer_name }} — Clear Released PV claimRef (allow rebind)"
+  ansible.builtin.command:
+    cmd: kubectl patch pv {{ rac_observer_name }}-system-pv --type json -p '[{"op":"remove","path":"/spec/claimRef"}]'
+  when:
+    - obs_pv_check.resources | length > 0
+    - obs_pv_check.resources[0].status.phase | default('') == 'Released'
+  changed_when: true
+
 - name: "{{ rac_observer_name }} — Create PersistentVolume"
   kubernetes.core.k8s:
     state: present
@@ -145,9 +153,20 @@
                   - name: cloudinitdisk
                     disk:
                       bus: virtio
+                interfaces:
+                  - name: default
+                    masquerade: {}
+                  - name: l2net
+                    bridge: {}
               resources:
                 requests:
                   memory: "{{ rac_observer_memory }}"
+            networks:
+              - name: default
+                pod: {}
+              - name: l2net
+                multus:
+                  networkName: rac-interconnect
             volumes:
               - name: rootdisk
                 persistentVolumeClaim:
@@ -180,6 +199,20 @@
                       - resize2fs /dev/vda1 || xfs_growfs /
                       - systemctl reload sshd
                       - |
+                        # Configure L2 interconnect on second NIC (before sub-mgr, which is slow)
+                        for attempt in $(seq 1 60); do
+                          DEFAULT_IF=$(ip route show default 2>/dev/null | awk '{print $5}' | head -1)
+                          for iface in $(ls /sys/class/net/ | grep -v '^lo$' | sort); do
+                            [ "$iface" = "$DEFAULT_IF" ] && continue
+                            nmcli con add type ethernet ifname "$iface" con-name l2-interconnect ip4 {{ rac_observer_priv_ip }}/24 2>/dev/null
+                            nmcli con up l2-interconnect 2>/dev/null
+                            echo "L2 interconnect configured on $iface with IP {{ rac_observer_priv_ip }}" | tee -a /var/log/cloudinit-observer.log
+                            exit 0
+                          done
+                          sleep 1
+                        done
+                        echo "WARNING: Could not find second NIC for L2 interconnect" | tee -a /var/log/cloudinit-observer.log
+                      - |
                         subscription-manager register \
                           --username="{{ subscription_username }}" \
                           --password="{{ subscription_password }}" \
@@ -211,24 +244,23 @@
 
 - name: Set observer IP
   ansible.builtin.set_fact:
-    rac_observer_ip: "{{ obs_vmi.resources[0].status.interfaces[0].ipAddress }}"
+    rac_observer_ip: "{{ rac_observer_priv_ip }}"
 
 - name: Add observer to inventory
   ansible.builtin.add_host:
     name: "{{ rac_observer_name }}"
     ansible_host: "{{ rac_observer_ip }}"
-    ansible_user: "oracle"
+    ansible_user: "root"
     ansible_password: "{{ rac_oracle_password }}"
     ansible_become: true
-    ansible_become_method: sudo
     ansible_ssh_common_args: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
 
-- name: Wait for SSH on observer
+- name: Wait for SSH on observer (L2 IP, cloud-init must configure NIC)
   ansible.builtin.wait_for:
     host: "{{ rac_observer_ip }}"
     port: 22
-    timeout: 300
-    delay: 10
+    timeout: 600
+    delay: 30
 
 # ---- Install Oracle Instant Client + dgmgrl on observer ----
 - name: Install Oracle Instant Client on observer
@@ -244,26 +276,17 @@
   register: ic_install
 
 # ---- Configure TNS for observer ----
-- name: Get primary IP for observer TNS
-  kubernetes.core.k8s_info:
-    api_version: kubevirt.io/v1
-    kind: VirtualMachineInstance
-    name: "{{ rac_node_names[0] }}"
-    namespace: "{{ kubevirt_namespace }}"
-  register: obs_primary_vmi
-
-- name: Get standby IP for observer TNS
-  kubernetes.core.k8s_info:
-    api_version: kubevirt.io/v1
-    kind: VirtualMachineInstance
-    name: "{{ rac_standby_name }}"
-    namespace: "{{ kubevirt_namespace }}"
-  register: obs_standby_vmi
-
 - name: Set IPs for observer TNS
   ansible.builtin.set_fact:
-    obs_primary_ip: "{{ obs_primary_vmi.resources[0].status.interfaces[0].ipAddress }}"
-    obs_standby_ip: "{{ obs_standby_vmi.resources[0].status.interfaces[0].ipAddress }}"
+    obs_primary_ip: "{{ rac_node1_priv_ip }}"
+    obs_standby_ip: "{{ rac_standby_priv_ip }}"
+
+- name: Create TNS admin directory on observer
+  delegate_to: "{{ rac_observer_name }}"
+  ansible.builtin.file:
+    path: /etc/oracle
+    state: directory
+    mode: '0755'
 
 - name: Create tnsnames.ora on observer
   delegate_to: "{{ rac_observer_name }}"
