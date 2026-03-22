@@ -53,6 +53,68 @@ The key insight: **the observability pipeline is not bolted on after deployment 
 
 ### One Command, Six Topologies
 
+The following diagram shows Topology C — the most complete variant — with all IP-addressable components:
+
+```mermaid
+flowchart TB
+    subgraph K8s["Kubernetes Cluster — KubeVirt"]
+        direction TB
+
+        subgraph L2["L2 VXLAN 192.168.10.0/24 — br-vm / vxlan100 VNI 100"]
+            direction TB
+
+            subgraph RAC["Oracle RAC Cluster — rac-cluster"]
+                direction LR
+                N1["<b>rac-node1</b><br/>192.168.10.11<br/>VIP: 192.168.10.21<br/>────────────────<br/>Grid Infrastructure<br/>ASM Instance +ASM1<br/>RAC DB Instance RACDB1<br/>Local Listener :1521<br/>4 vCPU · 8 Gi RAM"]
+                N2["<b>rac-node2</b><br/>192.168.10.12<br/>VIP: 192.168.10.22<br/>────────────────<br/>Grid Infrastructure<br/>ASM Instance +ASM2<br/>RAC DB Instance RACDB2<br/>Local Listener :1521<br/>4 vCPU · 8 Gi RAM"]
+            end
+
+            SCAN["<b>SCAN Listener</b><br/>rac-scan — 192.168.10.100:1521<br/>────────────────<br/>Load-balanced service access<br/>Registered by Grid Infrastructure<br/>Client entry point for RACDB / RACPDB1"]
+
+            subgraph DG["Data Guard"]
+                direction LR
+                SB["<b>rac-standby</b><br/>192.168.10.13<br/>────────────────<br/>Grid Infrastructure<br/>ASM +ASM_STBY<br/>Standby DB (RMAN dup)<br/>Redo Apply — real-time<br/>Listener :1521<br/>4 vCPU · 8 Gi RAM"]
+                OBS["<b>rac-observer</b><br/>192.168.10.14<br/>────────────────<br/>FSFO Observer<br/>Oracle Instant Client<br/>Monitors DG Broker<br/>Auto-failover trigger<br/>1 vCPU · 1 Gi RAM"]
+            end
+
+            BRIDGE["<b>br-vm</b> Gateway<br/>192.168.10.1"]
+        end
+
+        subgraph STORAGE["Shared ASM Disks — HostDisk"]
+            direction LR
+            DATA["+DATA<br/>asm-data.img<br/>20 GB"]
+            FRA["+FRA<br/>asm-fra.img<br/>10 GB"]
+            VOTE["+VOTE<br/>asm-vote.img<br/>2 GB"]
+        end
+
+        N1 & N2 --- DATA & FRA & VOTE
+        N1 <-- "Cluster<br/>Interconnect" --> N2
+        N1 & N2 -. "Redo Transport" .-> SB
+        OBS -. "DGMGRL<br/>monitoring" .-> N1 & SB
+        SCAN --- N1 & N2
+    end
+
+    Client(["fa:fa-laptop Application Client"]) -- "JDBC / OCI<br/>rac-scan:1521/RACPDB1" --> SCAN
+    OTEL(["fa:fa-chart-line OTEL Collector"]) -- "oracledb :1521<br/>prometheus :9100<br/>filelog" --> N1 & N2 & SB
+
+    style K8s fill:#0d1117,stroke:#30363d,color:#c9d1d9
+    style L2 fill:#161b22,stroke:#1a508b,color:#c9d1d9
+    style RAC fill:#1c2333,stroke:#e67e22,color:#c9d1d9
+    style DG fill:#1c2333,stroke:#27ae60,color:#c9d1d9
+    style STORAGE fill:#1c2333,stroke:#e94560,color:#c9d1d9
+    style N1 fill:#e67e22,stroke:#c0641a,color:#fff
+    style N2 fill:#e67e22,stroke:#c0641a,color:#fff
+    style SCAN fill:#e74c3c,stroke:#c0392b,color:#fff
+    style SB fill:#27ae60,stroke:#1e8449,color:#fff
+    style OBS fill:#8e44ad,stroke:#6c3483,color:#fff
+    style BRIDGE fill:#3498db,stroke:#2471a3,color:#fff
+    style DATA fill:#e94560,stroke:#c0392b,color:#fff
+    style FRA fill:#e94560,stroke:#c0392b,color:#fff
+    style VOTE fill:#e94560,stroke:#c0392b,color:#fff
+    style Client fill:#3498db,stroke:#2471a3,color:#fff
+    style OTEL fill:#2ecc71,stroke:#27ae60,color:#fff
+```
+
 The `oracle-rac-controller.yaml` playbook accepts a handful of declarative parameters and resolves which of six topology variants to deploy:
 
 | Topology | `rac_nodes` | `rac_dataguard` | `rac_fsfo` | Result |
