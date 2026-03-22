@@ -158,8 +158,8 @@
         install_collector: "{{ 'collector' in otel_install_components }}"
         install_vault: "{{ 'vault' in otel_install_components }}"
         install_redhat: "{{ 'redhat' in otel_install_components }}"
-        install_oracle: "{{ 'oracle' in otel_install_components }}"
-        install_oracle_rac: "{{ 'oracle-rac' in otel_install_components }}"
+        install_oracle: "{{ (otel_install_components | from_yaml | select('equalto', 'oracle') | list | length) > 0 if otel_install_components is string else (otel_install_components | select('equalto', 'oracle') | list | length) > 0 }}"
+        install_oracle_rac: "{{ (otel_install_components | from_yaml | select('equalto', 'oracle-rac') | list | length) > 0 if otel_install_components is string else (otel_install_components | select('equalto', 'oracle-rac') | list | length) > 0 }}"
         install_windows: "{{ 'windows' in otel_install_components }}"
         install_mssql: "{{ 'mssql' in otel_install_components }}"
         install_observe_dashboards: "{{ 'observe-dashboards' in otel_install_components }}"
@@ -198,6 +198,49 @@
         - install_oracle_rac | default(false) | bool
         - observe_ingest_endpoint is defined
         - observe_ingest_token is defined
+
+    # Fallback: when oracle-rac is being installed WITHOUT observe-dashboards
+    # in this run, but Terraform state already has the ingest token from a
+    # previous run, read it directly from terraform output.
+    - name: Check for existing Terraform state
+      ansible.builtin.stat:
+        path: "{{ playbook_dir }}/otel/observe-terraform/terraform.tfstate"
+      register: _tf_state_file
+      when:
+        - action == 'install'
+        - install_oracle_rac | default(false) | bool
+        - not (install_observe_dashboards | default(false) | bool)
+        - rac_otel_token in ['OTELTOKEN', '']
+
+    - name: Read ingest endpoint from existing Terraform state
+      ansible.builtin.command:
+        cmd: terraform output -raw ingest_endpoint
+        chdir: "{{ playbook_dir }}/otel/observe-terraform"
+      register: _tf_existing_endpoint
+      changed_when: false
+      failed_when: false
+      when:
+        - _tf_state_file.stat.exists | default(false)
+
+    - name: Read ingest token from existing Terraform state
+      ansible.builtin.command:
+        cmd: terraform output -raw ingest_token
+        chdir: "{{ playbook_dir }}/otel/observe-terraform"
+      register: _tf_existing_token
+      changed_when: false
+      failed_when: false
+      no_log: true
+      when:
+        - _tf_state_file.stat.exists | default(false)
+
+    - name: Wire existing Terraform ingest token into Oracle RAC collector
+      ansible.builtin.set_fact:
+        rac_otel_endpoint: "{{ _tf_existing_endpoint.stdout }}"
+        rac_otel_token: "{{ _tf_existing_token.stdout }}"
+      no_log: true
+      when:
+        - _tf_existing_endpoint.stdout | default('') | length > 0
+        - _tf_existing_token.stdout | default('') | length > 0
 
     - name: Run OTel install tasks
       include_tasks: otel/otel-collector-install.yaml

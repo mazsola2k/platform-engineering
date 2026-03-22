@@ -6,8 +6,8 @@
 #   metric  — metric name  (string)
 #   value   — numeric value (float64)
 #   tags.*  — Prometheus label dimensions
-# If your Observe tenant uses different field names (e.g. FIELDS.name,
-# EXTRA.attributes), adjust the OPAL pipelines below accordingly.
+# Metric metadata lives in FIELDS (name, value, type), while Prometheus
+# labels live in EXTRA.attributes (instance, db_name, host, etc.).
 # =============================================================================
 
 # ---------------------------------------------------------------------------
@@ -25,23 +25,34 @@ resource "observe_dataset" "oracle_rac_all" {
   }
 
   # Extract metric name, numeric value, and Prometheus labels from raw OTEL observations.
-  # The Prometheus receiver maps labels into FIELDS.attributes as a JSON object.
+  # The Prometheus receiver stores metric metadata in FIELDS, Prometheus labels
+  # in EXTRA.attributes, and scrape target info in EXTRA.resource.attributes.
+  # Coalesce across all three sources so fields resolve regardless of which
+  # labels the collector script or scrape config injected.
   stage {
     alias    = "extract"
     pipeline = <<-EOT
       make_col
         metric:string(FIELDS.name),
         value:float64(FIELDS.value),
-        instance:string(FIELDS.attributes.instance),
-        name:string(FIELDS.attributes.name),
-        wait_class:string(FIELDS.attributes.wait_class),
-        event:string(FIELDS.attributes.event),
-        sql_id:string(FIELDS.attributes.sql_id),
-        tablespace:string(FIELDS.attributes.tablespace),
-        role:string(FIELDS.attributes.role),
-        session_type:string(FIELDS.attributes.session_type),
-        component:string(FIELDS.attributes.component),
-        source:string(FIELDS.attributes.job)
+        instance:coalesce(string(EXTRA.attributes.instance), string(EXTRA.attributes.exported_instance), string(EXTRA.resource.attributes["service.instance.id"])),
+        db_name:coalesce(string(EXTRA.attributes.db_name), string(EXTRA.attributes.exported_db_name)),
+        host:coalesce(string(EXTRA.attributes.host), string(EXTRA.attributes.exported_host), string(EXTRA.resource.attributes["server.address"]), string(EXTRA.resource.attributes["service.instance.id"])),
+        cluster:string(EXTRA.attributes.cluster),
+        name:string(EXTRA.attributes.name),
+        wait_class:string(EXTRA.attributes.wait_class),
+        event:string(EXTRA.attributes.event),
+        sql_id:string(EXTRA.attributes.sql_id),
+        sql_text:string(EXTRA.attributes.sql_text),
+        tablespace:string(EXTRA.attributes.tablespace),
+        role:string(EXTRA.attributes.role),
+        session_type:string(EXTRA.attributes.type),
+        status:string(EXTRA.attributes.status),
+        pool:string(EXTRA.attributes.pool),
+        lmode:string(EXTRA.attributes.lmode),
+        request:string(EXTRA.attributes.request),
+        component:string(EXTRA.attributes.component),
+        source:coalesce(string(EXTRA.attributes.job), string(EXTRA.resource.attributes["service.name"]))
     EOT
   }
 

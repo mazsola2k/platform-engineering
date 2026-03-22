@@ -40,12 +40,28 @@ mkdir -p "${TEXTFILE_DIR}"
 trap "rm -f '${TEMP_FILE}'" EXIT
 
 # -----------------------------------------------------------
+# Pre-query Oracle metadata for metric labeling
+# Provides: instance name, database unique name, hostname
+# -----------------------------------------------------------
+DB_METADATA=$(echo "SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 200 TRIMSPOOL ON
+SELECT TRIM(i.instance_name) || '|' || TRIM(d.db_unique_name) || '|' || TRIM(i.host_name)
+FROM v\$instance i, v\$database d;" | sqlplus -S / as sysdba 2>/dev/null | grep -v '^$' | head -1)
+
+if [[ -n "${DB_METADATA}" && "${DB_METADATA}" == *"|"* ]]; then
+    IFS='|' read -r DB_INSTANCE DB_NAME DB_HOST <<< "${DB_METADATA}"
+else
+    DB_INSTANCE="${INSTANCE_NAME}"
+    DB_NAME="${ORACLE_SID}"
+    DB_HOST="${INSTANCE_NAME}"
+fi
+
+# -----------------------------------------------------------
 # Connectivity check — exit gracefully if Oracle unavailable
 # -----------------------------------------------------------
 if ! echo "SELECT 1 FROM dual;" | sqlplus -S / as sysdba 2>/dev/null | grep -q '1'; then
     cat > "${TEXTFILE_DIR}/oracle_perf.prom" <<EOF
-# Oracle instance not accessible on ${INSTANCE_NAME} at $(date -u +%Y-%m-%dT%H:%M:%SZ)
-oracle_up{instance="${INSTANCE_NAME}"} 0
+# Oracle instance not accessible on ${DB_HOST} at $(date -u +%Y-%m-%dT%H:%M:%SZ)
+oracle_up{instance="${DB_INSTANCE}",db_name="${DB_NAME}",host="${DB_HOST}"} 0
 EOF
     exit 0
 fi
@@ -55,8 +71,28 @@ fi
 # WHENEVER SQLERROR CONTINUE ensures individual section
 # failures (e.g. standby in MOUNT mode) don't abort the run.
 # Only lines matching Prometheus format are kept (grep filter).
+#
+# Post-processing: awk injects instance, db_name, host labels
+# into every metric line so Observe can identify the source.
 # -----------------------------------------------------------
-sqlplus -S / as sysdba 2>/dev/null <<'EOSQL' | grep -E '^(oracle_|# )' > "${TEMP_FILE}"
+sqlplus -S / as sysdba 2>/dev/null <<'EOSQL' | grep -E '^(oracle_|# )' | awk -v inst="${DB_INSTANCE}" -v dbname="${DB_NAME}" -v host="${DB_HOST}" '
+/^#/ { print; next }
+/{/ {
+  # Insert instance/db_name/host labels before the closing "} value" at end of line.
+  # SQL text has { } replaced with ( ) so the only } is the real label-set closer.
+  labels = ",instance=\"" inst "\",db_name=\"" dbname "\",host=\"" host "\""
+  n = match($0, /\} [-+]?[0-9][0-9.eE+-]*[ \t]*$/)
+  if (n > 0) {
+    print substr($0, 1, n-1) labels substr($0, n)
+  } else {
+    sub(/\}[[:space:]]*$/, labels "}")
+    print
+  }
+  next
+}
+/^oracle_/ { sub(/ /, "{instance=\"" inst "\",db_name=\"" dbname "\",host=\"" host "\"} "); print; next }
+{ print }
+' > "${TEMP_FILE}"
 SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 4000 TRIMSPOOL ON TAB OFF
 SET ECHO OFF VERIFY OFF TERMOUT ON SERVEROUT OFF LONG 200 NUMWIDTH 20
 WHENEVER SQLERROR CONTINUE
@@ -66,7 +102,7 @@ WHENEVER SQLERROR CONTINUE
 -- =================================================================
 SELECT '# HELP oracle_up Oracle instance is up and accessible' FROM dual;
 SELECT '# TYPE oracle_up gauge' FROM dual;
-SELECT 'oracle_up{instance="' || i.instance_name || '"} 1' FROM v$instance i;
+SELECT 'oracle_up 1' FROM dual;
 
 SELECT '# HELP oracle_instance_info Oracle instance metadata (value=1)' FROM dual;
 SELECT '# TYPE oracle_instance_info gauge' FROM dual;
@@ -245,15 +281,21 @@ WHERE ROWNUM <= 25;
 
 -- =================================================================
 -- 5. SQL TEXT MAPPING  (info metric, value=1)
--- Allows SREs to correlate sql_id to actual query text
+-- Allows SREs to correlate sql_id to actual query text.
+-- Escaping: \ → \\, " → \", {→(, }→) for Prometheus format safety.
 -- =================================================================
 SELECT '# HELP oracle_sql_text_info Maps sql_id to truncated SQL text (value=1)' FROM dual;
 SELECT '# TYPE oracle_sql_text_info gauge' FROM dual;
 SELECT 'oracle_sql_text_info{sql_id="' || sql_id ||
        '",sql_text="' ||
-       REPLACE(REPLACE(REPLACE(REPLACE(
+       REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(
            SUBSTR(sql_text, 1, 120),
-           '"', ''''), CHR(10), ' '), CHR(13), ' '), '\', '/') ||
+           '\', '\\'),
+           '"', '\"'),
+           CHR(10), ' '),
+           CHR(13), ' '),
+           '{', '('),
+           '}', ')') ||
        '"} 1'
 FROM (SELECT sql_id, sql_text FROM v$sqlarea ORDER BY elapsed_time DESC)
 WHERE ROWNUM <= 50;

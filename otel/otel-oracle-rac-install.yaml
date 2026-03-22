@@ -217,13 +217,16 @@
             'config': {
               'scrape_configs': [{
                 'job_name': 'rac-node-exporter-' ~ item.name,
+                'honor_labels': true,
                 'scrape_interval': '30s',
                 'static_configs': [{
                   'targets': [item.address ~ ':9100'],
                   'labels': {
                     'instance': item.name,
                     'role': item.role,
-                    'cluster': rac_cluster_name | default('rac-cluster')
+                    'cluster': rac_cluster_name | default('rac-cluster'),
+                    'db_name': rac_db_name,
+                    'host': item.name
                   }
                 }]
               }]

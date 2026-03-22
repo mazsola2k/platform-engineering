@@ -79,20 +79,29 @@
   changed_when: "'Terraform has been successfully initialized' in tf_init.stdout"
   when: observe_action | default('install') in ['install', 'uninstall']
 
+- name: "Observe dashboards — build terraform apply args"
+  ansible.builtin.set_fact:
+    _tf_apply_args: >-
+      {{
+        [ 'terraform', 'apply', '-auto-approve', '-input=false' ]
+        + ( [ '-var=observe_customer=' ~ observe_customer ] if observe_customer | default('') | length > 0 else [] )
+        + ( [ '-var=observe_api_token=' ~ observe_api_token ] if observe_api_token | default('') | length > 0 else [] )
+        + [
+            '-var=observe_domain=' ~ (observe_domain | default('observeinc.com')),
+            '-var=workspace_name=' ~ (observe_workspace | default('Default')),
+            '-var=otel_datastream_name=' ~ (observe_datastream_name | default('oracle-rac-otel')),
+            '-var=name_prefix=' ~ (observe_name_prefix | default('Oracle RAC'))
+          ]
+      }}
+  when: observe_action | default('install') == 'install'
+
 - name: "Observe dashboards — terraform apply"
   ansible.builtin.command:
-    cmd: >-
-      terraform apply -auto-approve -input=false
-      -var="observe_customer={{ observe_customer }}"
-      -var="observe_api_token={{ observe_api_token }}"
-      -var="observe_domain={{ observe_domain | default('observeinc.com') }}"
-      -var="workspace_name={{ observe_workspace | default('Default') }}"
-      -var="otel_datastream_name={{ observe_datastream_name | default('oracle-rac-otel') }}"
-      -var="name_prefix={{ observe_name_prefix | default('Oracle RAC') }}"
+    argv: "{{ _tf_apply_args }}"
     chdir: "{{ observe_tf_dir }}"
   environment:
-    OBSERVE_CUSTOMER: "{{ observe_customer }}"
-    OBSERVE_API_TOKEN: "{{ observe_api_token }}"
+    OBSERVE_CUSTOMER: "{{ observe_customer | default('') }}"
+    OBSERVE_API_TOKEN: "{{ observe_api_token | default('') }}"
     OBSERVE_DOMAIN: "{{ observe_domain | default('observeinc.com') }}"
   register: tf_apply
   no_log: true
