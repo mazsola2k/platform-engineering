@@ -267,7 +267,7 @@ flowchart LR
     end
 
     TF["<b>Stage 1 — terraform apply</b><br/>observe-terraform/"] -- "creates datastream,<br/>datasets, dashboards" --> CLOUD
-    TF -- "returns ingest token<br/>+ endpoint URL" -.-> COL
+    TF -. "returns ingest token<br/>+ endpoint URL" .-> COL
 
     NE -- ":9100" --> PR
     DB -- ":1521" --> OR
