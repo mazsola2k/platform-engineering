@@ -1,0 +1,220 @@
+---
+# =============================================================================
+# otel/otel-observe-dashboards.yaml
+# =============================================================================
+# Ansible tasks to manage Observe Inc datasets & dashboards for Oracle RAC
+# using the observeinc/observe Terraform provider.
+#
+# Actions:
+#   install   — terraform init + apply  (create/update datasets & dashboards)
+#   uninstall — terraform destroy        (remove all managed resources)
+#   status    — terraform output         (show current state)
+#
+# Required variables (passed from otel-controller.yaml or extra-vars):
+#   observe_customer       — Observe numeric customer ID
+#   observe_api_token      — Observe API token (sensitive)
+#   observe_domain         — Platform domain (default: observeinc.com)
+#   observe_workspace      — Workspace name  (default: Default)
+#   observe_metrics_dataset — Source dataset  (default: Metric)
+#   observe_name_prefix    — Dashboard prefix (default: Oracle RAC)
+#
+# These can also be supplied via env vars:
+#   OBSERVE_CUSTOMER, OBSERVE_API_TOKEN, OBSERVE_DOMAIN
+# =============================================================================
+
+- name: Set Observe Terraform working directory
+  ansible.builtin.set_fact:
+    observe_tf_dir: "{{ playbook_dir }}/otel/observe-terraform"
+
+- name: Check if Terraform is installed
+  ansible.builtin.command: which terraform
+  register: tf_which
+  changed_when: false
+  failed_when: false
+
+- name: Install Terraform via HashiCorp repo (Fedora/RHEL)
+  when: tf_which.rc != 0
+  block:
+    - name: Create HashiCorp RPM repository file
+      ansible.builtin.copy:
+        dest: /etc/yum.repos.d/hashicorp.repo
+        content: |
+          [hashicorp]
+          name=HashiCorp Stable - $basearch
+          baseurl=https://rpm.releases.hashicorp.com/fedora/$releasever/$basearch/stable
+          enabled=1
+          gpgcheck=1
+          gpgkey=https://rpm.releases.hashicorp.com/gpg
+        mode: "0644"
+      become: true
+
+    - name: Install terraform package
+      ansible.builtin.dnf:
+        name: terraform
+        state: present
+      become: true
+
+- name: Verify Terraform is installed
+  ansible.builtin.command: terraform version
+  register: tf_version
+  changed_when: false
+  failed_when: tf_version.rc != 0
+
+- name: Show Terraform version
+  ansible.builtin.debug:
+    msg: "{{ tf_version.stdout_lines[0] }}"
+
+# -------------------------------------------------------------------
+# INSTALL — terraform init + apply
+# -------------------------------------------------------------------
+- name: "Observe dashboards — terraform init"
+  ansible.builtin.command:
+    cmd: terraform init -input=false
+    chdir: "{{ observe_tf_dir }}"
+  environment:
+    OBSERVE_CUSTOMER: "{{ observe_customer }}"
+    OBSERVE_API_TOKEN: "{{ observe_api_token }}"
+    OBSERVE_DOMAIN: "{{ observe_domain | default('observeinc.com') }}"
+  register: tf_init
+  changed_when: "'Terraform has been successfully initialized' in tf_init.stdout"
+  when: observe_action | default('install') in ['install', 'uninstall']
+
+- name: "Observe dashboards — terraform apply"
+  ansible.builtin.command:
+    cmd: >-
+      terraform apply -auto-approve -input=false
+      -var="observe_customer={{ observe_customer }}"
+      -var="observe_api_token={{ observe_api_token }}"
+      -var="observe_domain={{ observe_domain | default('observeinc.com') }}"
+      -var="workspace_name={{ observe_workspace | default('Default') }}"
+      -var="otel_datastream_name={{ observe_datastream_name | default('oracle-rac-otel') }}"
+      -var="name_prefix={{ observe_name_prefix | default('Oracle RAC') }}"
+    chdir: "{{ observe_tf_dir }}"
+  environment:
+    OBSERVE_CUSTOMER: "{{ observe_customer }}"
+    OBSERVE_API_TOKEN: "{{ observe_api_token }}"
+    OBSERVE_DOMAIN: "{{ observe_domain | default('observeinc.com') }}"
+  register: tf_apply
+  no_log: true
+  when: observe_action | default('install') == 'install'
+
+- name: Show Observe apply summary
+  ansible.builtin.debug:
+    msg: "{{ tf_apply.stdout_lines | default([]) | select('match', '.*Apply complete.*|.*added.*changed.*destroyed.*') | list }}"
+  when: observe_action | default('install') == 'install' and tf_apply is defined
+
+# Capture the Terraform-managed ingest credentials so the OTEL collector
+# can be pointed at the new datastream automatically.
+- name: "Observe dashboards — fetch ingest endpoint"
+  ansible.builtin.command:
+    cmd: terraform output -raw ingest_endpoint
+    chdir: "{{ observe_tf_dir }}"
+  register: _tf_endpoint
+  changed_when: false
+  when: observe_action | default('install') == 'install' and (tf_apply.rc | default(1)) == 0
+
+- name: "Observe dashboards — fetch ingest token"
+  ansible.builtin.command:
+    cmd: terraform output -raw ingest_token
+    chdir: "{{ observe_tf_dir }}"
+  register: _tf_token
+  changed_when: false
+  no_log: true
+  when: observe_action | default('install') == 'install' and (tf_apply.rc | default(1)) == 0
+
+- name: Export Observe datastream ingest credentials
+  ansible.builtin.set_fact:
+    observe_ingest_endpoint: "{{ _tf_endpoint.stdout }}"
+    observe_ingest_token: "{{ _tf_token.stdout }}"
+  no_log: true
+  when:
+    - observe_action | default('install') == 'install'
+    - _tf_endpoint.stdout is defined
+    - _tf_token.stdout is defined
+
+- name: Display Observe ingest endpoint
+  ansible.builtin.debug:
+    msg: "Observe datastream ingest endpoint: {{ observe_ingest_endpoint | default('N/A') }} (token exported as fact)"
+  when: observe_ingest_endpoint is defined
+
+# -------------------------------------------------------------------
+# UNINSTALL — terraform destroy
+# -------------------------------------------------------------------
+- name: "Observe dashboards — terraform destroy"
+  ansible.builtin.command:
+    cmd: >-
+      terraform destroy -auto-approve -input=false
+      -var="observe_customer={{ observe_customer }}"
+      -var="observe_api_token={{ observe_api_token }}"
+      -var="observe_domain={{ observe_domain | default('observeinc.com') }}"
+      -var="workspace_name={{ observe_workspace | default('Default') }}"
+      -var="otel_datastream_name={{ observe_datastream_name | default('oracle-rac-otel') }}"
+      -var="name_prefix={{ observe_name_prefix | default('Oracle RAC') }}"
+    chdir: "{{ observe_tf_dir }}"
+  environment:
+    OBSERVE_CUSTOMER: "{{ observe_customer }}"
+    OBSERVE_API_TOKEN: "{{ observe_api_token }}"
+    OBSERVE_DOMAIN: "{{ observe_domain | default('observeinc.com') }}"
+  register: tf_destroy
+  no_log: true
+  when: observe_action | default('install') == 'uninstall'
+
+- name: Show Observe destroy summary
+  ansible.builtin.debug:
+    msg: "{{ tf_destroy.stdout_lines | default([]) | select('match', '.*Destroy complete.*|.*added.*changed.*destroyed.*') | list }}"
+  when: observe_action | default('install') == 'uninstall' and tf_destroy is defined
+
+# -------------------------------------------------------------------
+# STATUS — terraform output
+# -------------------------------------------------------------------
+- name: "Observe dashboards — terraform output"
+  ansible.builtin.command:
+    cmd: terraform output -json
+    chdir: "{{ observe_tf_dir }}"
+  environment:
+    OBSERVE_CUSTOMER: "{{ observe_customer | default('') }}"
+    OBSERVE_API_TOKEN: "{{ observe_api_token | default('') }}"
+    OBSERVE_DOMAIN: "{{ observe_domain | default('observeinc.com') }}"
+  register: tf_output
+  changed_when: false
+  failed_when: false
+  when: observe_action | default('install') == 'status'
+
+- name: Parse Observe outputs
+  ansible.builtin.set_fact:
+    observe_outputs: "{{ tf_output.stdout | default('{}') | from_json }}"
+  when: observe_action | default('install') == 'status' and tf_output.rc | default(1) == 0
+
+- name: Show Observe dashboard status
+  ansible.builtin.debug:
+    msg:
+      - "=== Observe Oracle RAC Dashboards ==="
+      - "Workspace:         {{ observe_outputs.workspace_oid.value | default('N/A') }}"
+      - "Console URL:       {{ observe_outputs.observe_console_url.value | default('N/A') }}"
+      - ""
+      - "--- Datastream & Ingest ---"
+      - "Datastream OID:    {{ observe_outputs.datastream_oid.value | default('N/A') }}"
+      - "Ingest Endpoint:   {{ observe_outputs.ingest_endpoint.value | default('N/A') }}"
+      - "Ingest Token:      (sensitive — use 'terraform output -raw ingest_token')"
+      - ""
+      - "--- Metric Datasets ---"
+      - "All Metrics:       {{ observe_outputs.dataset_all_metrics_oid.value | default('N/A') }}"
+      - "Instance Health:   {{ observe_outputs.dataset_instance_health_oid.value | default('N/A') }}"
+      - "System Stats:      {{ observe_outputs.dataset_sysstat_oid.value | default('N/A') }}"
+      - "Wait Events:       {{ observe_outputs.dataset_waits_oid.value | default('N/A') }}"
+      - "Top SQL:           {{ observe_outputs.dataset_top_sql_oid.value | default('N/A') }}"
+      - "ASH:               {{ observe_outputs.dataset_ash_oid.value | default('N/A') }}"
+      - "Storage & IO:      {{ observe_outputs.dataset_io_oid.value | default('N/A') }}"
+      - "Data Guard:        {{ observe_outputs.dataset_dataguard_oid.value | default('N/A') }}"
+      - ""
+      - "--- Log Datasets ---"
+      - "All Logs:          {{ observe_outputs.dataset_logs_oid.value | default('N/A') }}"
+      - "Alert Log:         {{ observe_outputs.dataset_alert_log_oid.value | default('N/A') }}"
+      - "Listener Log:      {{ observe_outputs.dataset_listener_log_oid.value | default('N/A') }}"
+      - "Audit Trail:       {{ observe_outputs.dataset_audit_oid.value | default('N/A') }}"
+      - ""
+      - "--- Dashboards ---"
+      - "Overview:          {{ observe_outputs.dashboard_overview_oid.value | default('N/A') }}"
+      - "SQL Performance:   {{ observe_outputs.dashboard_sql_oid.value | default('N/A') }}"
+      - "Wait Events & IO:  {{ observe_outputs.dashboard_waits_io_oid.value | default('N/A') }}"
+  when: observe_action | default('install') == 'status' and observe_outputs is defined

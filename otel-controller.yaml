@@ -58,8 +58,8 @@
       ansible.builtin.set_fact:
         otel_collector_image: "{{ otel_collector_image | default('otel/opentelemetry-collector-contrib:0.133.0') }}"
         vault_otel_endpoint: "{{ vault_otel_endpoint | default('OTELENDPOINT') }}"
-        vault_otel_token: "{{ vault_otel_token | default('OTELTOKEN', true) | trim | regex_replace('^(?i)none$', '') }}"
-        vault_metrics_token: "{{ (vault_metrics_token | default('', true) | trim | regex_replace('^(?i)none$', '')) or (vault_token | default('', true) | trim | regex_replace('^(?i)none$', '')) }}"
+        vault_otel_token: "{{ vault_otel_token | default('OTELTOKEN', true) | trim | regex_replace('(?i)^none$', '') }}"
+        vault_metrics_token: "{{ (vault_metrics_token | default('', true) | trim | regex_replace('(?i)^none$', '')) or (vault_token | default('', true) | trim | regex_replace('(?i)^none$', '')) }}"
         vault_token_file: "{{ vault_token_file | default('/root/.vault-token') }}"
         vault_token: "{{ vault_token | default(lookup('file', vault_token_file | default('/root/.vault-token'), errors='ignore') | default('', true) | trim, true) }}"
         oracle_otel_endpoint: "{{ oracle_otel_endpoint | default('OTELENDPOINT') }}"
@@ -74,7 +74,7 @@
         windows_admin_password: "{{ windows_admin_password | default('') }}"
         windows_admin_password_vault_path: "{{ windows_admin_password_vault_path | default(windows_vault_secret | default(vault_secret | default('secret/data/windows-server-2025/admin'))) }}"
         windows_otel_endpoint: "{{ windows_otel_endpoint | default(redhat_otel_endpoint | default(vault_otel_endpoint | default('OTELENDPOINT'))) }}"
-        windows_otel_token: "{{ windows_otel_token | default('OTELTOKEN', true) | trim | regex_replace('^(?i)none$', '') }}"
+        windows_otel_token: "{{ windows_otel_token | default('OTELTOKEN', true) | trim | regex_replace('(?i)^none$', '') }}"
         windows_exporter_port: "{{ windows_exporter_port | default(9182) }}"
         windows_exporter_version: "{{ windows_exporter_version | default('0.31.3') }}"
         vault_addr: "{{ vault_addr | default('http://localhost:8200') }}"
@@ -89,8 +89,8 @@
         mssql_sa_password_vault_path: "{{ mssql_sa_password_vault_path | default('') }}"
         mssql_sa_username: "{{ mssql_sa_username | default('sa') }}"
         mssql_sa_password: "{{ mssql_sa_password | default('') }}"
-        mssql_otel_endpoint: "{{ mssql_otel_endpoint | default('OTELENDPOINT', true) | trim | regex_replace('^(?i)none$', '') }}"
-        mssql_otel_token: "{{ mssql_otel_token | default('OTELTOKEN', true) | trim | regex_replace('^(?i)none$', '') }}"
+        mssql_otel_endpoint: "{{ mssql_otel_endpoint | default('OTELENDPOINT', true) | trim | regex_replace('(?i)^none$', '') }}"
+        mssql_otel_token: "{{ mssql_otel_token | default('OTELTOKEN', true) | trim | regex_replace('(?i)^none$', '') }}"
 
     - name: Align Windows admin username with MSSQL credentials when applicable
       ansible.builtin.set_fact:
@@ -109,6 +109,35 @@
         redhat_vm_password: "{{ redhat_vm_password | default(user_password | default('redhat')) }}"
         redhat_otel_endpoint: "{{ redhat_otel_endpoint | default('OTELENDPOINT') }}"
         redhat_otel_token: "{{ redhat_otel_token | default('OTELTOKEN') }}"
+
+    - name: Default Observe dashboards inputs
+      ansible.builtin.set_fact:
+        observe_customer: "{{ observe_customer | default(lookup('env', 'OBSERVE_CUSTOMER') | default('', true)) }}"
+        observe_api_token: "{{ observe_api_token | default(lookup('env', 'OBSERVE_API_TOKEN') | default('', true)) }}"
+        observe_domain: "{{ observe_domain | default(lookup('env', 'OBSERVE_DOMAIN') | default('observeinc.com', true)) }}"
+        observe_workspace: "{{ observe_workspace | default('Default') }}"
+        observe_datastream_name: "{{ observe_datastream_name | default('oracle-rac-otel') }}"
+        observe_name_prefix: "{{ observe_name_prefix | default('Oracle RAC') }}"
+      when: "'observe-dashboards' in otel_install_components"
+
+    - name: Default Oracle RAC telemetry inputs
+      ansible.builtin.set_fact:
+        rac_otel_endpoint: "{{ rac_otel_endpoint | default(oracle_otel_endpoint | default('OTELENDPOINT')) }}"
+        rac_otel_token: "{{ rac_otel_token | default(oracle_otel_token | default('OTELTOKEN')) }}"
+        rac_otel_db_user: "{{ rac_otel_db_user | default('system') }}"
+        rac_otel_db_pass: "{{ rac_otel_db_pass | default(rac_oracle_password | default('Oracle123')) }}"
+        rac_nodes: "{{ rac_nodes | default(2) }}"
+        rac_dataguard: "{{ rac_dataguard | default(true) }}"
+        rac_node_names: "{{ rac_node_names | default(['rac-node1', 'rac-node2']) }}"
+        rac_node1_priv_ip: "{{ rac_node1_priv_ip | default('192.168.10.11') }}"
+        rac_node2_priv_ip: "{{ rac_node2_priv_ip | default('192.168.10.12') }}"
+        rac_standby_name: "{{ rac_standby_name | default('rac-standby') }}"
+        rac_standby_priv_ip: "{{ rac_standby_priv_ip | default('192.168.10.13') }}"
+        rac_db_name: "{{ rac_db_name | default('RACDB') }}"
+        rac_pdb_name: "{{ rac_pdb_name | default('RACPDB1') }}"
+        rac_oracle_password: "{{ rac_oracle_password | default('Oracle123') }}"
+        rac_cluster_name: "{{ rac_cluster_name | default('rac-cluster') }}"
+      when: "'oracle-rac' in otel_install_components"
 
     - name: Default Oracle telemetry inputs
       ansible.builtin.set_fact:
@@ -130,8 +159,10 @@
         install_vault: "{{ 'vault' in otel_install_components }}"
         install_redhat: "{{ 'redhat' in otel_install_components }}"
         install_oracle: "{{ 'oracle' in otel_install_components }}"
+        install_oracle_rac: "{{ 'oracle-rac' in otel_install_components }}"
         install_windows: "{{ 'windows' in otel_install_components }}"
         install_mssql: "{{ 'mssql' in otel_install_components }}"
+        install_observe_dashboards: "{{ 'observe-dashboards' in otel_install_components }}"
 
     - name: Ensure Windows component enabled when MSSQL selected
       ansible.builtin.set_fact:
@@ -142,9 +173,31 @@
     - name: Ensure collector component present when enabling other pipelines
       ansible.builtin.assert:
         that:
-          - install_collector or (not install_vault and not install_redhat and not install_oracle and not install_windows and not install_mssql)
-        fail_msg: "Collector must be included when enabling Vault, Red Hat, Oracle, Windows, or MSSQL telemetry."
+          - install_collector or install_observe_dashboards or (not install_vault and not install_redhat and not install_oracle and not install_oracle_rac and not install_windows and not install_mssql)
+        fail_msg: "Collector must be included when enabling Vault, Red Hat, Oracle, Oracle RAC, Windows, or MSSQL telemetry."
       when: action == 'install'
+
+    # --- Observe Inc Dashboards (Terraform) ---
+    # Runs BEFORE the collector so the datastream ingest token is available.
+    - name: Run Observe dashboards tasks
+      include_tasks: otel/otel-observe-dashboards.yaml
+      vars:
+        observe_action: "{{ action }}"
+      when: install_observe_dashboards | default(false) | bool
+
+    # When observe-dashboards created a datastream, auto-wire its ingest
+    # credentials into the Oracle RAC collector.
+    - name: Wire Observe datastream token into Oracle RAC collector
+      ansible.builtin.set_fact:
+        rac_otel_endpoint: "{{ observe_ingest_endpoint }}"
+        rac_otel_token: "{{ observe_ingest_token }}"
+      no_log: true
+      when:
+        - action == 'install'
+        - install_observe_dashboards | default(false) | bool
+        - install_oracle_rac | default(false) | bool
+        - observe_ingest_endpoint is defined
+        - observe_ingest_token is defined
 
     - name: Run OTel install tasks
       include_tasks: otel/otel-collector-install.yaml
@@ -153,6 +206,7 @@
         include_vault: "{{ install_vault }}"
         include_redhat: "{{ install_redhat }}"
         include_oracle: "{{ install_oracle }}"
+        include_oracle_rac: "{{ install_oracle_rac }}"
         include_windows: "{{ install_windows }}"
         include_mssql: "{{ install_mssql }}"
 

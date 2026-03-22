@@ -16,6 +16,7 @@
     otel_env_vars: []
     configured_redhat_collectors: []
     configured_oracle_collectors: []
+    configured_oracle_rac_collectors: []
     configured_windows_collectors: []
     configured_mssql_collectors: []
 
@@ -24,6 +25,7 @@
     include_vault: "{{ include_vault | default(false) }}"
     include_redhat: "{{ include_redhat | default(false) }}"
     include_oracle: "{{ include_oracle | default(false) }}"
+    include_oracle_rac: "{{ include_oracle_rac | default(false) }}"
     include_windows: "{{ include_windows | default(false) }}"
     include_mssql: "{{ include_mssql | default(false) }}"
 
@@ -34,13 +36,13 @@
     vault_metrics_token_resolved: >-
       {{
         (
-          vault_metrics_token | default('', true) | trim | regex_replace('^(?i)none$', '')
+          vault_metrics_token | default('', true) | trim | regex_replace('(?i)^none$', '')
         )
         or (
-          vault_token | default('', true) | trim | regex_replace('^(?i)none$', '')
+          vault_token | default('', true) | trim | regex_replace('(?i)^none$', '')
         )
         or (
-          lookup('file', '/root/.vault-token', errors='ignore') | default('') | trim | regex_replace('^(?i)none$', '')
+          lookup('file', '/root/.vault-token', errors='ignore') | default('') | trim | regex_replace('(?i)^none$', '')
         )
       }}
   when: include_vault | bool
@@ -67,6 +69,10 @@
   ansible.builtin.include_tasks: otel-oracle-install.yaml
   when: include_oracle | bool
 
+- name: Include Oracle RAC metrics configuration
+  ansible.builtin.include_tasks: otel-oracle-rac-install.yaml
+  when: include_oracle_rac | default(false) | bool
+
 - name: Include Windows telemetry configuration
   ansible.builtin.include_tasks: otel-windows-install.yaml
   when: include_windows | bool
@@ -86,6 +92,11 @@
   ansible.builtin.debug:
     msg: "Configured Oracle collectors: {{ configured_oracle_collectors }}"
   when: configured_oracle_collectors | length > 0
+
+- name: Show configured Oracle RAC telemetry targets
+  ansible.builtin.debug:
+    msg: "Configured Oracle RAC collectors: {{ configured_oracle_rac_collectors }}"
+  when: configured_oracle_rac_collectors | length > 0
 
 - name: Show configured Windows telemetry targets
   ansible.builtin.debug:
@@ -172,6 +183,9 @@
           },
           'spec': {
             'replicas': 1,
+            'strategy': {
+              'type': 'Recreate' if (otel_host_network | default(false) | bool) else 'RollingUpdate'
+            },
             'selector': {
               'matchLabels': {
                 'app': 'otel-collector'
@@ -184,6 +198,7 @@
                 }
               },
               'spec': {
+                'hostNetwork': otel_host_network | default(false) | bool,
                 'dnsConfig': {
                   'options': [
                     {
@@ -225,3 +240,4 @@
   kubernetes.core.k8s:
     state: present
     definition: "{{ otel_deployment_definition }}"
+    force: "{{ (otel_host_network | default(false) | bool) | ternary(true, false) }}"

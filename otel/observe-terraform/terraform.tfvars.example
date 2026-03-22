@@ -1,0 +1,10 @@
+# =============================================================================
+# Example terraform.tfvars — copy to terraform.tfvars and fill in values
+# =============================================================================
+
+observe_customer     = ""               # Observe numeric customer ID
+observe_api_token    = ""               # Observe API token (id-xxx from Settings > API Tokens)
+observe_domain       = "observeinc.com"
+workspace_name       = "Default"
+otel_metrics_dataset = "Metric"      # Auto-created by Observe OTEL ingest
+name_prefix          = "Oracle RAC"

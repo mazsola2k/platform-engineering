@@ -1,0 +1,374 @@
+---
+# Oracle RAC Performance / Workload Generator
+# Generates synthetic OLTP + analytical SQL workload for SRE metric validation.
+#
+# Called from oracle-rac-controller.yaml with rac_action=perftest
+#
+# Tunables (override with -e):
+#   perf_duration:     Duration in seconds (default 300 = 5 min)
+#   perf_parallel:     Number of OLTP worker sessions (default 4)
+#   perf_collect:      Run metrics collection after workload (default true)
+#   perf_cleanup:      Drop workload schema when done (default false)
+#   perf_target:       Which node to run on: "node1" (default) or "all"
+
+# -----------------------------------------------------------
+# 1. SETUP — create workload schema in PDB
+# -----------------------------------------------------------
+- name: "Perf — Set workload parameters"
+  ansible.builtin.set_fact:
+    _perf_duration: "{{ perf_duration | default(300) }}"
+    _perf_parallel: "{{ perf_parallel | default(4) }}"
+    _perf_collect: "{{ perf_collect | default(true) | bool }}"
+    _perf_cleanup: "{{ perf_cleanup | default(false) | bool }}"
+    _perf_target: "{{ perf_target | default('node1') }}"
+    _perf_pdb: "{{ rac_pdb_name | default('RACPDB1') }}"
+    _perf_node1_ip: "{{ rac_node1_priv_ip }}"
+    _perf_password: "{{ rac_oracle_password }}"
+    _perf_oracle_home: "/u01/app/oracle/product/26ai/dbhome_1"
+    _perf_db_name: "{{ rac_db_name | default('RACDB') }}"
+
+- name: "Perf — Display workload plan"
+  ansible.builtin.debug:
+    msg:
+      - "Oracle RAC Performance Test"
+      - "  Duration:  {{ _perf_duration }}s"
+      - "  Parallel:  {{ _perf_parallel }} OLTP workers + 1 analytics"
+      - "  Target:    {{ _perf_target }}"
+      - "  PDB:       {{ _perf_pdb }}"
+      - "  Cleanup:   {{ _perf_cleanup }}"
+
+- name: "Perf — Build target list"
+  ansible.builtin.set_fact:
+    _perf_targets: >-
+      {{ (_perf_target == 'all') | ternary(
+           [{'name': rac_node_names[0], 'ip': rac_node1_priv_ip}] +
+           (((rac_nodes | int) > 1) | ternary(
+             [{'name': rac_node_names[1], 'ip': rac_node2_priv_ip}], []
+           )),
+           [{'name': rac_node_names[0], 'ip': rac_node1_priv_ip}]
+         ) }}
+
+# -----------------------------------------------------------
+# 2. Schema setup on node1 (PDB)
+# -----------------------------------------------------------
+- name: "Perf — Create workload schema in {{ _perf_pdb }}"
+  delegate_to: localhost
+  ansible.builtin.shell: |
+    sshpass -p '{{ _perf_password }}' ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+      root@{{ _perf_node1_ip }} 'su - oracle -c "
+    export ORACLE_SID={{ _perf_db_name }}
+    export ORACLE_HOME={{ _perf_oracle_home }}
+    export PATH=\${ORACLE_HOME}/bin:\${PATH}
+    sqlplus -S / as sysdba <<EOSQL
+    SET ECHO OFF FEEDBACK OFF SERVEROUT ON
+
+    ALTER SESSION SET CONTAINER = {{ _perf_pdb }};
+
+    -- Create workload user if not exists
+    DECLARE
+      v_cnt NUMBER;
+    BEGIN
+      SELECT COUNT(*) INTO v_cnt FROM dba_users WHERE username = '\''WORKLOAD'\'';
+      IF v_cnt = 0 THEN
+        EXECUTE IMMEDIATE '\''CREATE USER workload IDENTIFIED BY WorkLoad123 DEFAULT TABLESPACE USERS QUOTA UNLIMITED ON USERS'\'';
+        EXECUTE IMMEDIATE '\''GRANT CONNECT, RESOURCE, CREATE SESSION, CREATE TABLE, CREATE SEQUENCE, CREATE VIEW TO workload'\'';
+        DBMS_OUTPUT.PUT_LINE('\''USER=created'\'');
+      ELSE
+        DBMS_OUTPUT.PUT_LINE('\''USER=exists'\'');
+      END IF;
+    END;
+    /
+
+    -- Drop existing objects
+    BEGIN EXECUTE IMMEDIATE '\''DROP TABLE workload.wl_orders PURGE'\''; EXCEPTION WHEN OTHERS THEN NULL; END;
+    /
+    BEGIN EXECUTE IMMEDIATE '\''DROP TABLE workload.wl_audit_log PURGE'\''; EXCEPTION WHEN OTHERS THEN NULL; END;
+    /
+    BEGIN EXECUTE IMMEDIATE '\''DROP TABLE workload.wl_customers PURGE'\''; EXCEPTION WHEN OTHERS THEN NULL; END;
+    /
+    BEGIN EXECUTE IMMEDIATE '\''DROP TABLE workload.wl_products PURGE'\''; EXCEPTION WHEN OTHERS THEN NULL; END;
+    /
+    BEGIN EXECUTE IMMEDIATE '\''DROP SEQUENCE workload.wl_seq'\''; EXCEPTION WHEN OTHERS THEN NULL; END;
+    /
+
+    -- Create tables
+    CREATE TABLE workload.wl_customers (
+      cust_id    NUMBER PRIMARY KEY,
+      name       VARCHAR2(100),
+      email      VARCHAR2(200),
+      region     VARCHAR2(50),
+      balance    NUMBER(12,2),
+      created_dt DATE DEFAULT SYSDATE
+    );
+
+    CREATE TABLE workload.wl_products (
+      prod_id    NUMBER PRIMARY KEY,
+      name       VARCHAR2(100),
+      category   VARCHAR2(50),
+      price      NUMBER(10,2),
+      stock      NUMBER
+    );
+
+    CREATE TABLE workload.wl_orders (
+      order_id   NUMBER PRIMARY KEY,
+      cust_id    NUMBER REFERENCES workload.wl_customers(cust_id),
+      prod_id    NUMBER REFERENCES workload.wl_products(prod_id),
+      qty        NUMBER,
+      total      NUMBER(12,2),
+      status     VARCHAR2(20),
+      order_dt   DATE DEFAULT SYSDATE
+    );
+
+    CREATE TABLE workload.wl_audit_log (
+      log_id     NUMBER,
+      action     VARCHAR2(50),
+      detail     VARCHAR2(4000),
+      ts         TIMESTAMP DEFAULT SYSTIMESTAMP
+    );
+
+    CREATE SEQUENCE workload.wl_seq START WITH 1 INCREMENT BY 1 CACHE 100;
+
+    -- Seed 10K customers
+    INSERT /*+ APPEND */ INTO workload.wl_customers
+    SELECT LEVEL,
+           '\''Customer_'\'' || LEVEL,
+           '\''cust'\'' || LEVEL || '\''@example.com'\'',
+           CASE MOD(LEVEL, 5) WHEN 0 THEN '\''EMEA'\'' WHEN 1 THEN '\''APAC'\'' WHEN 2 THEN '\''AMER'\'' WHEN 3 THEN '\''LATAM'\'' ELSE '\''GLOBAL'\'' END,
+           ROUND(DBMS_RANDOM.VALUE(100, 50000), 2),
+           SYSDATE - DBMS_RANDOM.VALUE(1, 365)
+    FROM dual CONNECT BY LEVEL <= 10000;
+    COMMIT;
+
+    -- Seed 5K products
+    INSERT /*+ APPEND */ INTO workload.wl_products
+    SELECT LEVEL,
+           '\''Product_'\'' || LEVEL,
+           CASE MOD(LEVEL, 4) WHEN 0 THEN '\''Electronics'\'' WHEN 1 THEN '\''Software'\'' WHEN 2 THEN '\''Services'\'' ELSE '\''Hardware'\'' END,
+           ROUND(DBMS_RANDOM.VALUE(10, 5000), 2),
+           TRUNC(DBMS_RANDOM.VALUE(0, 1000))
+    FROM dual CONNECT BY LEVEL <= 5000;
+    COMMIT;
+
+    -- Indexes for mixed access patterns
+    CREATE INDEX workload.idx_cust_region ON workload.wl_customers(region);
+    CREATE INDEX workload.idx_cust_balance ON workload.wl_customers(balance);
+    CREATE INDEX workload.idx_prod_category ON workload.wl_products(category);
+    CREATE INDEX workload.idx_orders_cust ON workload.wl_orders(cust_id);
+    CREATE INDEX workload.idx_orders_dt ON workload.wl_orders(order_dt);
+    CREATE INDEX workload.idx_orders_status ON workload.wl_orders(status);
+
+    EXEC DBMS_STATS.GATHER_TABLE_STATS('\''WORKLOAD'\'', '\''WL_CUSTOMERS'\'');
+    EXEC DBMS_STATS.GATHER_TABLE_STATS('\''WORKLOAD'\'', '\''WL_PRODUCTS'\'');
+
+    SELECT '\''SCHEMA=ready: '\'' || COUNT(*) || '\'' customers, '\'' ||
+           (SELECT COUNT(*) FROM workload.wl_products) || '\'' products'\''
+    FROM workload.wl_customers;
+
+    EXIT;
+    EOSQL
+    "' 2>/dev/null
+  register: _perf_schema
+  changed_when: "'SCHEMA=ready' in _perf_schema.stdout"
+  failed_when: _perf_schema.rc != 0
+
+- name: "Perf — Schema setup result"
+  ansible.builtin.debug:
+    msg: "{{ _perf_schema.stdout_lines | select('match', '(USER=|SCHEMA=)') | list | default(['Schema ready']) }}"
+
+# -----------------------------------------------------------
+# 3. Deploy workload runner script
+# -----------------------------------------------------------
+- name: "Perf — Deploy workload runner to target VMs"
+  delegate_to: localhost
+  ansible.builtin.shell: |
+    sshpass -p '{{ _perf_password }}' scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+      {{ playbook_dir }}/oracle-rac/rac-perf-worker.sh \
+      root@{{ item.ip }}:/tmp/rac-perf-worker.sh 2>/dev/null
+    sshpass -p '{{ _perf_password }}' ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+      root@{{ item.ip }} 'chmod +x /tmp/rac-perf-worker.sh' 2>/dev/null
+  loop: "{{ _perf_targets }}"
+  loop_control:
+    label: "{{ item.name }}"
+  changed_when: true
+
+# -----------------------------------------------------------
+# 4. Launch workload (async)
+# -----------------------------------------------------------
+- name: "Perf — Launch OLTP workers on {{ item.name }}"
+  delegate_to: localhost
+  ansible.builtin.shell: |
+    sshpass -p '{{ _perf_password }}' ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+      root@{{ item.ip }} 'bash -s' <<'REMOTE'
+    set -e
+    for w in $(seq 1 {{ _perf_parallel }}); do
+      su - oracle -c "ORACLE_SID={{ _perf_db_name }} ORACLE_HOME={{ _perf_oracle_home }} \
+        /tmp/rac-perf-worker.sh {{ _perf_duration }} ${w} oltp {{ _perf_pdb }} localhost" \
+        > /tmp/perf-oltp-${w}.log 2>&1 &
+      echo "OLTP worker ${w} started (PID $!)"
+    done
+    su - oracle -c "ORACLE_SID={{ _perf_db_name }} ORACLE_HOME={{ _perf_oracle_home }} \
+      /tmp/rac-perf-worker.sh {{ _perf_duration }} 0 analytics {{ _perf_pdb }} localhost" \
+      > /tmp/perf-analytics.log 2>&1 &
+    echo "Analytics worker started (PID $!)"
+    echo "WORKERS=launched"
+    REMOTE
+  register: _perf_launch
+  loop: "{{ _perf_targets }}"
+  loop_control:
+    label: "{{ item.name }}"
+  changed_when: "'WORKERS=launched' in _perf_launch.stdout"
+  failed_when: "'WORKERS=launched' not in _perf_launch.stdout"
+
+- name: "Perf — Workers are running"
+  ansible.builtin.debug:
+    msg:
+      - "Workload running on {{ _perf_targets | map(attribute='name') | join(', ') }}"
+      - "  {{ _perf_parallel }} OLTP + 1 analytics workers per node"
+      - "  Duration: {{ _perf_duration }}s"
+      - "  Waiting for completion..."
+
+# -----------------------------------------------------------
+# 5. Wait for completion and collect results
+# -----------------------------------------------------------
+- name: "Perf — Wait for workload to complete"
+  delegate_to: localhost
+  ansible.builtin.shell: |
+    sshpass -p '{{ _perf_password }}' ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+      root@{{ item.ip }} 'bash -s' <<'REMOTE'
+    TIMEOUT={{ (_perf_duration | int + 120) }}
+    ELAPSED=0
+    while [ $ELAPSED -lt $TIMEOUT ]; do
+      RUNNING=$(pgrep -f "rac-perf-worker" -c 2>/dev/null || echo "0")
+      if [ "$RUNNING" = "0" ]; then
+        echo "All workers finished after ${ELAPSED}s"
+        break
+      fi
+      sleep 10
+      ELAPSED=$((ELAPSED + 10))
+    done
+
+    echo "=== OLTP Results ==="
+    for f in /tmp/perf-oltp-*.log; do
+      [ -f "$f" ] && tail -2 "$f"
+    done
+    echo "=== Analytics Results ==="
+    [ -f /tmp/perf-analytics.log ] && tail -2 /tmp/perf-analytics.log
+
+    su - oracle -c "
+    export ORACLE_SID={{ _perf_db_name }}
+    export ORACLE_HOME={{ _perf_oracle_home }}
+    export PATH=\${ORACLE_HOME}/bin:\${PATH}
+    sqlplus -S / as sysdba <<EOSQL
+    SET ECHO OFF FEEDBACK OFF HEADING OFF
+    ALTER SESSION SET CONTAINER = {{ _perf_pdb }};
+    SELECT 'ORDERS=' || COUNT(*) FROM workload.wl_orders;
+    SELECT 'AUDIT=' || COUNT(*) FROM workload.wl_audit_log;
+    EXIT;
+    EOSQL
+    " 2>/dev/null
+    REMOTE
+  register: _perf_results
+  loop: "{{ _perf_targets }}"
+  loop_control:
+    label: "{{ item.name }}"
+  changed_when: false
+  async: "{{ (_perf_duration | int) + 180 }}"
+  poll: 15
+
+- name: "Perf — Workload results"
+  ansible.builtin.debug:
+    msg: |
+      {{ item.item.name }}:
+      {{ item.stdout | default('no output') }}
+  loop: "{{ _perf_results.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.name | default('unknown') }}"
+
+# -----------------------------------------------------------
+# 6. Trigger metrics collection
+# -----------------------------------------------------------
+- name: "Perf — Collect fresh Oracle performance metrics"
+  delegate_to: localhost
+  ansible.builtin.shell: |
+    sshpass -p '{{ _perf_password }}' ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+      root@{{ item.ip }} \
+      'su - oracle -c "ORACLE_SID={{ _perf_db_name }} ORACLE_HOME={{ _perf_oracle_home }} /usr/local/bin/oracle-rac-perf-collector.sh" 2>/dev/null && \
+       wc -l /var/lib/node_exporter/textfile_collector/oracle_perf.prom 2>/dev/null || echo "0 lines"'
+  register: _perf_metrics
+  loop: "{{ _perf_targets }}"
+  loop_control:
+    label: "{{ item.name }}"
+  changed_when: false
+  when: _perf_collect
+
+- name: "Perf — Metrics collection results"
+  ansible.builtin.debug:
+    msg: "{{ item.item.name }}: {{ item.stdout | default('skipped') | trim }}"
+  loop: "{{ _perf_metrics.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.name | default('unknown') }}"
+  when: _perf_collect and _perf_metrics.results is defined
+
+# -----------------------------------------------------------
+# 7. Show key metrics summary via node_exporter
+# -----------------------------------------------------------
+- name: "Perf — Fetch key metrics from node_exporter"
+  delegate_to: localhost
+  ansible.builtin.uri:
+    url: "http://{{ item.ip }}:9100/metrics"
+    return_content: true
+  register: _perf_node_metrics
+  loop: "{{ _perf_targets }}"
+  loop_control:
+    label: "{{ item.name }}"
+  failed_when: false
+  when: _perf_collect
+
+- name: "Perf — Top SQL summary"
+  ansible.builtin.debug:
+    msg: |
+      === {{ item.item.name }} — Top 10 SQL by elapsed time ===
+      {% set lines = item.content | default('') | regex_findall('oracle_top_sql_elapsed_seconds\\{sql_id="([^"]+)"\\} (.+)') %}
+      {% for sql_id, elapsed in (lines | sort(attribute='1', reverse=true))[:10] %}
+        sql_id={{ sql_id }}  elapsed={{ elapsed }}s
+      {% endfor %}
+
+      === Active sessions (ASH last 5 min) ===
+      {% for line in item.content | default('') | regex_findall('oracle_ash_active_sessions\\{wait_class="([^"]+)"\\} (.+)') %}
+        {{ line[0] }}: {{ line[1] }} samples
+      {% endfor %}
+
+      === Efficiency ===
+      buffer_cache_hit={{ (item.content | default('') | regex_search('oracle_buffer_cache_hit_ratio (.+)', '\\1')) | first | default('N/A') }}%
+      library_cache_hit={{ (item.content | default('') | regex_search('oracle_library_cache_hit_ratio (.+)', '\\1')) | first | default('N/A') }}%
+      soft_parse={{ (item.content | default('') | regex_search('oracle_soft_parse_ratio (.+)', '\\1')) | first | default('N/A') }}%
+  loop: "{{ _perf_node_metrics.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.name | default('unknown') }}"
+  when: _perf_collect and _perf_node_metrics.results is defined
+
+# -----------------------------------------------------------
+# 8. Cleanup (optional)
+# -----------------------------------------------------------
+- name: "Perf — Cleanup workload schema"
+  delegate_to: localhost
+  ansible.builtin.shell: |
+    sshpass -p '{{ _perf_password }}' ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+      root@{{ _perf_node1_ip }} 'su - oracle -c "
+    export ORACLE_SID={{ _perf_db_name }}
+    export ORACLE_HOME={{ _perf_oracle_home }}
+    export PATH=\${ORACLE_HOME}/bin:\${PATH}
+    sqlplus -S / as sysdba <<EOSQL
+    ALTER SESSION SET CONTAINER = {{ _perf_pdb }};
+    DROP USER workload CASCADE;
+    PROMPT CLEANUP=done
+    EXIT;
+    EOSQL
+    "' 2>/dev/null
+  register: _perf_cleanup_result
+  changed_when: "'CLEANUP=done' in _perf_cleanup_result.stdout"
+  when: _perf_cleanup
+
+- name: "Perf — Cleanup result"
+  ansible.builtin.debug:
+    msg: "Workload schema {{ _perf_cleanup | ternary('dropped', 'retained (use -e perf_cleanup=true to drop)') }}"

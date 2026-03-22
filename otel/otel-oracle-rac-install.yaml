@@ -26,7 +26,7 @@
         'name': item.name,
         'address': item.ip,
         'port': rac_listener_port | default(1521),
-        'service': rac_pdb_name,
+        'service': rac_db_name,
         'role': item.role
       }] }}
   loop:
@@ -43,7 +43,7 @@
         'name': rac_standby_name,
         'address': rac_standby_priv_ip,
         'port': rac_listener_port | default(1521),
-        'service': rac_pdb_name,
+        'service': rac_db_name,
         'role': 'standby'
       }] }}
   when: rac_dataguard | bool
@@ -99,6 +99,92 @@
   changed_when: "'installed' in _otel_node_exporter.stdout"
   failed_when: false
 
+# ---- Enable node_exporter textfile collector for Oracle performance metrics ----
+- name: Configure node_exporter textfile collector on RAC VMs
+  delegate_to: localhost
+  ansible.builtin.shell: |
+    sshpass -p '{{ rac_oracle_password }}' ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+      root@{{ item.address }} 'bash -s' <<'REMOTE'
+    set -e
+    mkdir -p /var/lib/node_exporter/textfile_collector
+    chown oracle:oinstall /var/lib/node_exporter/textfile_collector
+
+    # Add textfile collector flag to node_exporter if not already present
+    if ! grep -q 'textfile' /etc/systemd/system/node_exporter.service 2>/dev/null; then
+      sed -i 's|ExecStart=.*node_exporter.*|ExecStart=/usr/local/bin/node_exporter --collector.textfile.directory=/var/lib/node_exporter/textfile_collector|' \
+        /etc/systemd/system/node_exporter.service
+      systemctl daemon-reload
+      systemctl restart node_exporter
+      echo "TEXTFILE_COLLECTOR=configured"
+    else
+      echo "TEXTFILE_COLLECTOR=already_configured"
+    fi
+    REMOTE
+  register: _otel_textfile
+  loop: "{{ _otel_rac_instances }}"
+  loop_control:
+    label: "{{ item.name }}"
+  changed_when: "'TEXTFILE_COLLECTOR=configured' in _otel_textfile.stdout"
+  failed_when: false
+
+# ---- Deploy Oracle performance metrics collector script ----
+- name: Deploy Oracle performance metrics collector to RAC VMs
+  delegate_to: localhost
+  ansible.builtin.shell: |
+    sshpass -p '{{ rac_oracle_password }}' scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+      {{ playbook_dir }}/otel/oracle-rac-perf-collector.sh \
+      root@{{ item.address }}:/usr/local/bin/oracle-rac-perf-collector.sh
+    sshpass -p '{{ rac_oracle_password }}' ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+      root@{{ item.address }} 'chmod 755 /usr/local/bin/oracle-rac-perf-collector.sh'
+  register: _otel_script_deploy
+  loop: "{{ _otel_rac_instances }}"
+  loop_control:
+    label: "{{ item.name }}"
+  changed_when: true
+
+- name: Configure Oracle metrics cron job on RAC VMs
+  delegate_to: localhost
+  ansible.builtin.shell: |
+    sshpass -p '{{ rac_oracle_password }}' ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+      root@{{ item.address }} 'bash -s' <<'REMOTE'
+    set -e
+    CRON_LINE='* * * * * ORACLE_SID={{ rac_db_name }} ORACLE_HOME=/u01/app/oracle/product/26ai/dbhome_1 /usr/local/bin/oracle-rac-perf-collector.sh >/dev/null 2>&1'
+    if ! crontab -u oracle -l 2>/dev/null | grep -q oracle-rac-perf-collector; then
+      (crontab -u oracle -l 2>/dev/null || true; echo "$CRON_LINE") | crontab -u oracle -
+      echo "CRON=installed"
+    else
+      echo "CRON=already_installed"
+    fi
+    REMOTE
+  register: _otel_cron
+  loop: "{{ _otel_rac_instances }}"
+  loop_control:
+    label: "{{ item.name }}"
+  changed_when: "'CRON=installed' in _otel_cron.stdout"
+  failed_when: false
+
+- name: Run initial Oracle metrics collection on RAC VMs
+  delegate_to: localhost
+  ansible.builtin.shell: |
+    sshpass -p '{{ rac_oracle_password }}' ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+      root@{{ item.address }} \
+      'su - oracle -c "ORACLE_SID={{ rac_db_name }} ORACLE_HOME=/u01/app/oracle/product/26ai/dbhome_1 /usr/local/bin/oracle-rac-perf-collector.sh" 2>/dev/null && \
+       wc -l /var/lib/node_exporter/textfile_collector/oracle_perf.prom 2>/dev/null || echo "0 lines"'
+  register: _otel_initial_collection
+  loop: "{{ _otel_rac_instances }}"
+  loop_control:
+    label: "{{ item.name }}"
+  changed_when: false
+  failed_when: false
+
+- name: Display initial metrics collection results
+  ansible.builtin.debug:
+    msg: "{{ item.item.name }}: {{ item.stdout | default('no output') | trim }}"
+  loop: "{{ _otel_initial_collection.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.name | default('unknown') }}"
+  when: _otel_initial_collection.results is defined
+
 # ---- Merge per-instance receivers into otel_config ----
 - name: Build Oracle RAC receiver config fragment
   ansible.builtin.set_fact:
@@ -114,11 +200,7 @@
             'service': item.service,
             'username': '${RAC_OTEL_DB_USER}',
             'password': '${RAC_OTEL_DB_PASS}',
-            'collection_interval': '60s',
-            'resource_attributes': {
-              'db.instance': { 'value': item.name },
-              'db.role': { 'value': item.role }
-            }
+            'collection_interval': '60s'
           }
         }) }}
     _rac_receiver_names: "{{ _rac_receiver_names + ['oracledb/rac-' ~ item.name] }}"
@@ -149,6 +231,50 @@
           }
         }) }}
     _rac_receiver_names: "{{ _rac_receiver_names + ['prometheus/rac-' ~ item.name] }}"
+  loop: "{{ _otel_rac_instances }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+# ---- Filelog receivers for Oracle alert log, listener log, audit trail ----
+- name: Build filelog receivers for Oracle log shipping
+  ansible.builtin.set_fact:
+    _rac_filelog_receivers: {}
+    _rac_filelog_receiver_names: []
+
+- name: Add filelog receiver per RAC instance
+  ansible.builtin.set_fact:
+    _rac_filelog_receivers: >-
+      {{ _rac_filelog_receivers | combine({
+          'filelog/rac-' ~ item.name: {
+            'include': [
+              '/u01/app/oracle/diag/rdbms/' ~ (rac_db_name | lower) ~ '/' ~ (rac_db_name) ~ '/trace/alert_' ~ (rac_db_name) ~ '.log',
+              '/u01/app/grid/diag/tnslsnr/' ~ item.name ~ '/listener/trace/listener.log',
+              '/u01/app/oracle/admin/' ~ rac_db_name ~ '/adump/*.aud'
+            ],
+            'start_at': 'end',
+            'operators': [
+              {
+                'type': 'regex_parser',
+                'regex': '^(?P<timestamp>[\\d-]+ [\\d:.]+)\\s*(?P<body>.*)$',
+                'timestamp': {
+                  'parse_from': 'attributes.timestamp',
+                  'layout': '%Y-%m-%d %H:%M:%S.%f',
+                  'layout_type': 'strptime'
+                }
+              }
+            ],
+            'attributes': {
+              'instance': item.name,
+              'role': item.role,
+              'cluster': rac_cluster_name | default('rac-cluster')
+            },
+            'resource': {
+              'service.name': 'oracle-rac-' ~ item.name,
+              'host.name': item.name
+            }
+          }
+        }) }}
+    _rac_filelog_receiver_names: "{{ _rac_filelog_receiver_names + ['filelog/rac-' ~ item.name] }}"
   loop: "{{ _otel_rac_instances }}"
   loop_control:
     label: "{{ item.name }}"
@@ -185,6 +311,7 @@
 - name: Register Oracle RAC OTel metadata
   ansible.builtin.set_fact:
     configured_oracle_rac_collectors: "{{ _otel_rac_instances | map(attribute='name') | list }}"
+    otel_host_network: true
 
 - name: Display Oracle RAC OTel configuration status
   ansible.builtin.debug:

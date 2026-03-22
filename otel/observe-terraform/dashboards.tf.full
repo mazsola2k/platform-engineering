@@ -1,0 +1,334 @@
+# =============================================================================
+# Dashboards — Oracle RAC Observability
+# =============================================================================
+# Each dashboard has stages (OPAL pipelines) and a layout (card grid).
+# Stages produce data; layout items reference stage IDs to render widgets.
+#
+# Layout grid: 12 columns wide. Each item has card (stageId ref) + layout (h,w,x,y).
+# Section cards define collapsible groups.
+#
+# Stage layout is set to null — the Observe UI auto-generates the
+# visualisation config from the OPAL output.
+# =============================================================================
+
+locals {
+  # Shorthand for dataset input binding
+  _ds_all = {
+    datasetId   = observe_dataset.oracle_rac_all.id
+    datasetPath = null
+    inputName   = "Oracle RAC Metrics"
+    inputRole   = "Data"
+    stageId     = null
+  }
+
+  # Default stage layout time range
+  _stage_list_layout = {
+    isModified = false
+    timeRange = {
+      display               = "Past 1 hour"
+      endTime               = null
+      millisFromCurrentTime = 3600000
+      originalDisplay       = "Past 1 hour"
+      startTime             = null
+      timeRangeInfo = {
+        key        = "PRESETS"
+        name       = "Presets"
+        presetType = "PAST_1_HOUR"
+      }
+    }
+  }
+}
+
+# ============================================================================
+# Dashboard 1 — Oracle RAC Overview
+# ============================================================================
+resource "observe_dashboard" "oracle_rac_overview" {
+  workspace   = data.observe_workspace.default.oid
+  name        = "${var.name_prefix} — Overview"
+  description = "Instance health, efficiency, sessions, memory, and process utilisation."
+  icon_url    = "dashboard"
+
+  stages = jsonencode([
+    {
+      id       = "stage-inst-up"
+      input    = [local._ds_all]
+      layout   = null
+      params   = null
+      pipeline = "filter metric = \"oracle_up\"\ntimechart options(empty_bins:true), up:last(value), group_by(instance)"
+    },
+    {
+      id       = "stage-uptime"
+      input    = [local._ds_all]
+      layout   = null
+      params   = null
+      pipeline = "filter metric = \"oracle_instance_uptime_seconds\"\nmake_col uptime_hours: value / 3600\ntimechart options(empty_bins:true), hours:last(uptime_hours), group_by(instance)"
+    },
+    {
+      id       = "stage-sessions"
+      input    = [local._ds_all]
+      layout   = null
+      params   = null
+      pipeline = "filter metric ~ /^oracle_session_count|oracle_sessions_/\ntimechart options(empty_bins:true), count:avg(value), group_by(metric)"
+    },
+    {
+      id       = "stage-processes"
+      input    = [local._ds_all]
+      layout   = null
+      params   = null
+      pipeline = "filter metric ~ /^oracle_(process_count|process_limit|session_count|session_limit)$/\ntimechart options(empty_bins:true), val:last(value), group_by(metric)"
+    },
+    {
+      id       = "stage-cache-hit"
+      input    = [local._ds_all]
+      layout   = null
+      params   = null
+      pipeline = "filter metric ~ /hit_ratio$/\ntimechart options(empty_bins:true), ratio:avg(value), group_by(metric)"
+    },
+    {
+      id       = "stage-sga"
+      input    = [local._ds_all]
+      layout   = null
+      params   = null
+      pipeline = "filter metric = \"oracle_sga_bytes\"\ntimechart options(empty_bins:true), bytes:avg(value), group_by(component)"
+    },
+    {
+      id       = "stage-pga"
+      input    = [local._ds_all]
+      layout   = null
+      params   = null
+      pipeline = "filter metric = \"oracle_pga_stat\"\ntimechart options(empty_bins:true), val:avg(value), group_by(name)"
+    },
+    {
+      id       = "stage-sysstat-io"
+      input    = [local._ds_all]
+      layout   = null
+      params   = null
+      pipeline = "filter metric = \"oracle_sysstat\"\nfilter name ~ /physical reads|physical writes|db block gets|consistent gets/\ntimechart options(empty_bins:true), val:rate(value), group_by(name)"
+    }
+  ])
+
+  layout = jsonencode({
+    autoPack = true
+    gridLayout = {
+      sections = [
+        {
+          card = { cardType = "section", closed = false, title = "Instance Health" }
+          items = [
+            { card = { cardType = "stage", stageId = "stage-inst-up" }, layout = { h = 10, w = 6, x = 0, y = 0 } },
+            { card = { cardType = "stage", stageId = "stage-uptime" }, layout = { h = 10, w = 6, x = 6, y = 0 } },
+            { card = { cardType = "stage", stageId = "stage-sessions" }, layout = { h = 10, w = 6, x = 0, y = 10 } },
+            { card = { cardType = "stage", stageId = "stage-processes" }, layout = { h = 10, w = 6, x = 6, y = 10 } },
+            { card = { cardType = "stage", stageId = "stage-cache-hit" }, layout = { h = 10, w = 4, x = 0, y = 20 } },
+            { card = { cardType = "stage", stageId = "stage-sga" }, layout = { h = 10, w = 4, x = 4, y = 20 } },
+            { card = { cardType = "stage", stageId = "stage-pga" }, layout = { h = 10, w = 4, x = 8, y = 20 } },
+            { card = { cardType = "stage", stageId = "stage-sysstat-io" }, layout = { h = 12, w = 12, x = 0, y = 30 } }
+          ]
+        }
+      ]
+    }
+    stageListLayout = local._stage_list_layout
+  })
+}
+
+# ============================================================================
+# Dashboard 2 — Oracle RAC SQL Performance
+# ============================================================================
+resource "observe_dashboard" "oracle_rac_sql" {
+  workspace   = data.observe_workspace.default.oid
+  name        = "${var.name_prefix} — SQL Performance"
+  description = "Top SQL by elapsed time, CPU, buffer gets, and disk reads. ASH session activity."
+  icon_url    = "sql"
+
+  stages = jsonencode([
+    {
+      id       = "stage-sql-elapsed"
+      input    = [local._ds_all]
+      layout   = null
+      params   = null
+      pipeline = "filter metric = \"oracle_top_sql_elapsed_seconds\"\ntimechart options(empty_bins:true), elapsed_sec:max(value), group_by(sql_id)"
+    },
+    {
+      id       = "stage-sql-cpu"
+      input    = [local._ds_all]
+      layout   = null
+      params   = null
+      pipeline = "filter metric = \"oracle_top_sql_cpu_seconds\"\ntimechart options(empty_bins:true), cpu_sec:max(value), group_by(sql_id)"
+    },
+    {
+      id       = "stage-sql-bufgets"
+      input    = [local._ds_all]
+      layout   = null
+      params   = null
+      pipeline = "filter metric = \"oracle_top_sql_buffer_gets\"\ntimechart options(empty_bins:true), buf_gets:max(value), group_by(sql_id)"
+    },
+    {
+      id       = "stage-sql-diskreads"
+      input    = [local._ds_all]
+      layout   = null
+      params   = null
+      pipeline = "filter metric = \"oracle_top_sql_disk_reads\"\ntimechart options(empty_bins:true), disk_reads:max(value), group_by(sql_id)"
+    },
+    {
+      id       = "stage-sql-execs"
+      input    = [local._ds_all]
+      layout   = null
+      params   = null
+      pipeline = "filter metric = \"oracle_top_sql_executions\"\ntimechart options(empty_bins:true), execs:max(value), group_by(sql_id)"
+    },
+    {
+      id       = "stage-sql-latency"
+      input    = [local._ds_all]
+      layout   = null
+      params   = null
+      pipeline = "filter metric = \"oracle_top_sql_elapsed_per_exec_ms\"\ntimechart options(empty_bins:true), ms_per_exec:avg(value), group_by(sql_id)"
+    },
+    {
+      id       = "stage-ash"
+      input    = [local._ds_all]
+      layout   = null
+      params   = null
+      pipeline = "filter metric = \"oracle_ash_activity\"\ntimechart options(empty_bins:true), samples:sum(value), group_by(wait_class)"
+    },
+    {
+      id       = "stage-long-sql"
+      input    = [local._ds_all]
+      layout   = null
+      params   = null
+      pipeline = "filter metric = \"oracle_long_running_sql\"\ntimechart options(empty_bins:true), count:sum(value), group_by(instance)"
+    }
+  ])
+
+  layout = jsonencode({
+    autoPack = true
+    gridLayout = {
+      sections = [
+        {
+          card = { cardType = "section", closed = false, title = "SQL Performance" }
+          items = [
+            { card = { cardType = "stage", stageId = "stage-sql-elapsed" }, layout = { h = 10, w = 6, x = 0, y = 0 } },
+            { card = { cardType = "stage", stageId = "stage-sql-cpu" }, layout = { h = 10, w = 6, x = 6, y = 0 } },
+            { card = { cardType = "stage", stageId = "stage-sql-bufgets" }, layout = { h = 10, w = 6, x = 0, y = 10 } },
+            { card = { cardType = "stage", stageId = "stage-sql-diskreads" }, layout = { h = 10, w = 6, x = 6, y = 10 } },
+            { card = { cardType = "stage", stageId = "stage-sql-execs" }, layout = { h = 10, w = 6, x = 0, y = 20 } },
+            { card = { cardType = "stage", stageId = "stage-sql-latency" }, layout = { h = 10, w = 6, x = 6, y = 20 } },
+            { card = { cardType = "stage", stageId = "stage-ash" }, layout = { h = 10, w = 6, x = 0, y = 30 } },
+            { card = { cardType = "stage", stageId = "stage-long-sql" }, layout = { h = 10, w = 6, x = 6, y = 30 } }
+          ]
+        }
+      ]
+    }
+    stageListLayout = local._stage_list_layout
+  })
+}
+
+# ============================================================================
+# Dashboard 3 — Oracle RAC Wait Events & I/O
+# ============================================================================
+resource "observe_dashboard" "oracle_rac_waits_io" {
+  workspace   = data.observe_workspace.default.oid
+  name        = "${var.name_prefix} — Wait Events & IO"
+  description = "Wait-class breakdown, top events, tablespace I/O, redo log, and Data Guard lag."
+  icon_url    = "hourglass"
+
+  stages = jsonencode([
+    {
+      id       = "stage-wc-time"
+      input    = [local._ds_all]
+      layout   = null
+      params   = null
+      pipeline = "filter metric = \"oracle_wait_class_time_seconds\"\ntimechart options(empty_bins:true), sec:rate(value), group_by(wait_class)"
+    },
+    {
+      id       = "stage-wc-waits"
+      input    = [local._ds_all]
+      layout   = null
+      params   = null
+      pipeline = "filter metric = \"oracle_wait_class_total_waits\"\ntimechart options(empty_bins:true), waits:rate(value), group_by(wait_class)"
+    },
+    {
+      id       = "stage-top-events"
+      input    = [local._ds_all]
+      layout   = null
+      params   = null
+      pipeline = "filter metric = \"oracle_wait_event_time_seconds\"\ntimechart options(empty_bins:true), sec:rate(value), group_by(event)"
+    },
+    {
+      id       = "stage-avg-wait"
+      input    = [local._ds_all]
+      layout   = null
+      params   = null
+      pipeline = "filter metric = \"oracle_wait_event_avg_wait_ms\"\ntimechart options(empty_bins:true), ms:avg(value), group_by(event)"
+    },
+    {
+      id       = "stage-ts-reads"
+      input    = [local._ds_all]
+      layout   = null
+      params   = null
+      pipeline = "filter metric ~ /^oracle_tablespace_io_read/\ntimechart options(empty_bins:true), val:rate(value), group_by(tablespace)"
+    },
+    {
+      id       = "stage-ts-writes"
+      input    = [local._ds_all]
+      layout   = null
+      params   = null
+      pipeline = "filter metric ~ /^oracle_tablespace_io_write/\ntimechart options(empty_bins:true), val:rate(value), group_by(tablespace)"
+    },
+    {
+      id       = "stage-redo"
+      input    = [local._ds_all]
+      layout   = null
+      params   = null
+      pipeline = "filter metric ~ /^oracle_redo_/\ntimechart options(empty_bins:true), val:last(value), group_by(metric)"
+    },
+    {
+      id       = "stage-dg-lag"
+      input    = [local._ds_all]
+      layout   = null
+      params   = null
+      pipeline = "filter metric ~ /^oracle_dataguard_/\ntimechart options(empty_bins:true), lag_sec:max(value), group_by(metric)"
+    },
+    {
+      id       = "stage-blocked"
+      input    = [local._ds_all]
+      layout   = null
+      params   = null
+      pipeline = "filter metric = \"oracle_blocked_sessions\"\ntimechart options(empty_bins:true), blocked:sum(value), group_by(instance)"
+    },
+    {
+      id       = "stage-enqueue"
+      input    = [local._ds_all]
+      layout   = null
+      params   = null
+      pipeline = "filter metric = \"oracle_sysstat\"\nfilter name ~ /enqueue/\ntimechart options(empty_bins:true), val:rate(value), group_by(name)"
+    }
+  ])
+
+  layout = jsonencode({
+    autoPack = true
+    gridLayout = {
+      sections = [
+        {
+          card = { cardType = "section", closed = false, title = "Wait Events" }
+          items = [
+            { card = { cardType = "stage", stageId = "stage-wc-time" }, layout = { h = 10, w = 6, x = 0, y = 0 } },
+            { card = { cardType = "stage", stageId = "stage-wc-waits" }, layout = { h = 10, w = 6, x = 6, y = 0 } },
+            { card = { cardType = "stage", stageId = "stage-top-events" }, layout = { h = 10, w = 6, x = 0, y = 10 } },
+            { card = { cardType = "stage", stageId = "stage-avg-wait" }, layout = { h = 10, w = 6, x = 6, y = 10 } }
+          ]
+        },
+        {
+          card = { cardType = "section", closed = false, title = "Storage & I/O" }
+          items = [
+            { card = { cardType = "stage", stageId = "stage-ts-reads" }, layout = { h = 10, w = 6, x = 0, y = 0 } },
+            { card = { cardType = "stage", stageId = "stage-ts-writes" }, layout = { h = 10, w = 6, x = 6, y = 0 } },
+            { card = { cardType = "stage", stageId = "stage-redo" }, layout = { h = 10, w = 4, x = 0, y = 10 } },
+            { card = { cardType = "stage", stageId = "stage-dg-lag" }, layout = { h = 10, w = 4, x = 4, y = 10 } },
+            { card = { cardType = "stage", stageId = "stage-blocked" }, layout = { h = 10, w = 4, x = 8, y = 10 } },
+            { card = { cardType = "stage", stageId = "stage-enqueue" }, layout = { h = 12, w = 12, x = 0, y = 20 } }
+          ]
+        }
+      ]
+    }
+    stageListLayout = local._stage_list_layout
+  })
+}

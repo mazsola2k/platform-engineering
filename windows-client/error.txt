@@ -1,0 +1,647 @@
+can you check why / what was the latest kernel panic or why my fedora frozed
+
+Yes, Peter — we can try to pinpoint the cause of a kernel panic or system freeze on Fedora. Since freezes and panics are logged by the kernel, the main sources are journal logs, kernel logs, and sometimes coredumps. Here’s a thorough way to check.
+
+1. Check the system journal for kernel errors
+
+Run:
+
+sudo journalctl -k -b -1
+
+-k → kernel messages only
+
+-b -1 → logs from the previous boot (where the freeze/panic happened)
+
+Look for keywords like:
+
+panic
+
+BUG
+
+Oops
+
+Call trace
+
+lockup
+
+BTRFS (if relevant) or other filesystem messages
+
+2. Check the full system log from the previous boot
+sudo journalctl -b -1
+
+This includes all services and kernel messages.
+
+Scroll near the end of the log; freezes usually leave the last messages there.
+
+You can filter for errors:
+
+sudo journalctl -b -1 -p 3
+
+-p 3 → only critical errors
+
+3. Inspect dmesg for kernel messages
+
+Even after a reboot, dmesg can show the last kernel messages before the crash if persistent logging is enabled:
+
+sudo dmesg -T | less
+
+Look for:
+
+kernel panic
+
+BUG: unable to handle kernel
+
+oom-killer messages (out of memory)
+
+I/O error or disk issues
+
+4. Check for crash dumps (if kdump is enabled)
+
+Fedora can save crash dumps in /var/crash/. Check if any exist:
+
+ls -lh /var/crash/
+
+You can use coredumpctl to examine them:
+
+sudo coredumpctl list
+
+And inspect a crash:
+
+sudo coredumpctl info <PID>
+5. Possible common causes of freezes
+
+Hardware issues: RAM, CPU overheating, failing disks (especially if Btrfs shows errors).
+
+Kernel bugs: some Fedora kernel versions had regressions with certain drivers.
+
+Driver issues: GPU or NVMe/SSD drivers.
+
+Resource exhaustion: high memory or swap usage causing OOM kills.
+
+✅ Next step: I can give you a single command to pull all relevant kernel panic/freeze clues from Fedora logs, so you can see the most likely culprit without digging manually.
+
+Do you want me to do that?
+
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: input: PC Speaker as /devices/platform/pcspkr/input/input15
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: piix4_smbus 0000:00:14.0: SMBus Host Controller at 0xb00, revision 0
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: piix4_smbus 0000:00:14.0: Using register 0x02 for SMBus port selection
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: Bluetooth: Core ver 2.22
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: NET: Registered PF_BLUETOOTH protocol family
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: Bluetooth: HCI device and connection manager initialized
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: Bluetooth: HCI socket layer initialized
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: Bluetooth: L2CAP socket layer initialized
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: Bluetooth: SCO socket layer initialized
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: i2c i2c-0: Successfully instantiated SPD at 0x50
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: nvidia: loading out-of-tree module taints kernel.
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: nvidia: module verification failed: signature and/or required key missing - tainting kernel
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: i2c i2c-0: Successfully instantiated SPD at 0x51
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: i2c i2c-0: Successfully instantiated SPD at 0x52
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: i2c i2c-0: Successfully instantiated SPD at 0x53
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: piix4_smbus 0000:00:14.0: Auxiliary SMBus Host Controller at 0xb20
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: igb: Intel(R) Gigabit Ethernet Network Driver
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: igb: Copyright (c) 2007-2014 Intel Corporation.
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: RAPL PMU: API unit is 2^-32 Joules, 2 fixed counters, 163840 ms ovfl timer
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: RAPL PMU: hw unit of domain package 2^-16 Joules
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: RAPL PMU: hw unit of domain core 2^-16 Joules
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: igb 0000:05:00.0: enabling device (0000 -> 0002)
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: cfg80211: Loading compiled-in X.509 certificates for regulatory database
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: Loaded X.509 cert 'sforshee: 00b28ddf47aef9cea7'
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: Loaded X.509 cert 'wens: 61c038651aabdcf94bd0ac7ff06c7248db18c600'
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: igb 0000:05:00.0: added PHC on eth0
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: igb 0000:05:00.0: Intel(R) Gigabit Ethernet Network Connection
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: igb 0000:05:00.0: eth0: (PCIe:2.5Gb/s:Width x1) 70:85:c2:d9:2c:93
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: igb 0000:05:00.0: eth0: PBA No: FFFFFF-0FF
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: igb 0000:05:00.0: Using MSI-X interrupts. 2 rx queue(s), 2 tx queue(s)
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: igb 0000:05:00.0 enp5s0: renamed from eth0
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: usbcore: registered new device driver apple-mfi-fastcharge
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: nvidia-nvlink: Nvlink Core is being initialized, major device number 511
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: 
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: ee1004 0-0050: 512 byte EE1004-compliant SPD EEPROM, read-only
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: NVRM: GPU 0000:03:00.0 is already bound to vfio-pci.
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: nvidia 0000:0a:00.0: vgaarb: VGA decodes changed: olddecodes=io+mem,decodes=none:owns=io+mem
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: ee1004 0-0051: 512 byte EE1004-compliant SPD EEPROM, read-only
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: ee1004 0-0052: 512 byte EE1004-compliant SPD EEPROM, read-only
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: ee1004 0-0053: 512 byte EE1004-compliant SPD EEPROM, read-only
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: iwlwifi 0000:04:00.0: enabling device (0000 -> 0002)
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: iwlwifi 0000:04:00.0: Detected crf-id 0x400410, cnv-id 0x400410 wfpm id 0x80000000
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: iwlwifi 0000:04:00.0: PCI dev 2725/0024, rev=0x420, rfid=0x10d000
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: iwlwifi 0000:04:00.0: Detected Intel(R) Wi-Fi 6E AX210 160MHz
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: NVRM: The NVIDIA probe routine was not called for 1 device(s).
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: NVRM: This can occur when another driver was loaded and 
+                                               NVRM: obtained ownership of the NVIDIA device(s).
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: NVRM: Try unloading the conflicting kernel module (and/or
+                                               NVRM: reconfigure your kernel without the conflicting
+                                               NVRM: driver(s)), then try loading the NVIDIA kernel module
+                                               NVRM: again.
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: NVRM: loading NVIDIA UNIX Open Kernel Module for x86_64  580.119.02  Release Build  (dvs-builder@U22-I3-B15-03-5)  Mon Dec  8 07:51:55 UTC 2025
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: kvm_amd: TSC scaling supported
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: kvm_amd: Nested Virtualization enabled
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: kvm_amd: Nested Paging enabled
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: kvm_amd: LBR virtualization supported
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: kvm_amd: SEV disabled (ASIDs 1 - 509)
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: kvm_amd: SEV-ES disabled (ASIDs 0 - 0)
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: kvm_amd: Virtual VMLOAD VMSAVE supported
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: kvm_amd: Virtual GIF supported
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: iwlwifi 0000:04:00.0: loaded firmware version 89.df9556fc.0 ty-a0-gf-a0-89.ucode op_mode iwlmvm
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: MCE: In-kernel MCE decoding enabled.
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: usbcore: registered new interface driver btusb
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: Bluetooth: hci0: Firmware timestamp 2025.20 buildtype 1 build 82053
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: Bluetooth: hci0: Firmware SHA1: 0x937bca4a
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: Bluetooth: hci0: No support for _PRR ACPI method
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: nvidia-modeset: Loading NVIDIA UNIX Open Kernel Mode Setting Driver for x86_64  580.119.02  Release Build  (dvs-builder@U22-I3-B15-03-5)  Mon Dec  8 07:38:31 UTC 2>
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: [drm] [nvidia-drm] [GPU ID 0x00000a00] Loading driver
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: snd_hda_intel 0000:0a:00.1: Disabling MSI
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: snd_hda_intel 0000:0a:00.1: Handle vga_switcheroo audio client
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: snd_hda_intel 0000:0c:00.4: enabling device (0000 -> 0002)
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: Bluetooth: hci0: Found device firmware: intel/ibt-0041-0041.sfi
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: Bluetooth: hci0: Boot Address: 0x100800
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: Bluetooth: hci0: Firmware Version: 133-20.25
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: Bluetooth: hci0: Firmware already loaded
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: Bluetooth: hci0: Fseq status: Success (0x00)
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: Bluetooth: hci0: Fseq executed: 00.00.02.42
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: Bluetooth: hci0: Fseq BT Top: 00.00.02.41
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: input: HDA NVidia HDMI/DP,pcm=3 as /devices/pci0000:00/0000:00:03.1/0000:0a:00.1/sound/card0/input16
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: input: HDA NVidia HDMI/DP,pcm=7 as /devices/pci0000:00/0000:00:03.1/0000:0a:00.1/sound/card0/input17
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: input: HDA NVidia HDMI/DP,pcm=8 as /devices/pci0000:00/0000:00:03.1/0000:0a:00.1/sound/card0/input18
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: input: HDA NVidia HDMI/DP,pcm=9 as /devices/pci0000:00/0000:00:03.1/0000:0a:00.1/sound/card0/input19
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: intel_rapl_common: Found RAPL domain package
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: intel_rapl_common: Found RAPL domain core
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: amd_atl: AMD Address Translation Library initialized
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: snd_hda_codec_alc882 hdaudioC1D0: ALCS1200A: SKU not ready 0x00000000
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: snd_hda_codec_alc882 hdaudioC1D0: autoconfig for ALCS1200A: line_outs=1 (0x14/0x0/0x0/0x0/0x0) type:line
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: snd_hda_codec_alc882 hdaudioC1D0:    speaker_outs=0 (0x0/0x0/0x0/0x0/0x0)
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: snd_hda_codec_alc882 hdaudioC1D0:    hp_outs=1 (0x1b/0x0/0x0/0x0/0x0)
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: snd_hda_codec_alc882 hdaudioC1D0:    mono: mono_out=0x0
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: snd_hda_codec_alc882 hdaudioC1D0:    inputs:
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: snd_hda_codec_alc882 hdaudioC1D0:      Rear Mic=0x18
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: snd_hda_codec_alc882 hdaudioC1D0:      Front Mic=0x19
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: snd_hda_codec_alc882 hdaudioC1D0:      Line=0x1a
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: input: HD-Audio Generic Rear Mic as /devices/pci0000:00/0000:00:08.1/0000:0c:00.4/sound/card1/input20
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: input: HD-Audio Generic Front Mic as /devices/pci0000:00/0000:00:08.1/0000:0c:00.4/sound/card1/input21
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: input: HD-Audio Generic Line as /devices/pci0000:00/0000:00:08.1/0000:0c:00.4/sound/card1/input22
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: input: HD-Audio Generic Line Out as /devices/pci0000:00/0000:00:08.1/0000:0c:00.4/sound/card1/input23
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: input: HD-Audio Generic Front Headphone as /devices/pci0000:00/0000:00:08.1/0000:0c:00.4/sound/card1/input24
+Mar 01 17:45:20 k8sp.modernhackers.com kernel: EXT4-fs (nvme0n1p2): mounted filesystem 9ca2a062-6a05-405e-bd94-c89594ec7831 r/w with ordered data mode. Quota mode: none.
+Mar 01 17:45:21 k8sp.modernhackers.com kernel: iwlwifi 0000:04:00.0: WFPM_UMAC_PD_NOTIFICATION: 0x20
+Mar 01 17:45:21 k8sp.modernhackers.com kernel: iwlwifi 0000:04:00.0: WFPM_LMAC2_PD_NOTIFICATION: 0x1f
+Mar 01 17:45:21 k8sp.modernhackers.com kernel: iwlwifi 0000:04:00.0: WFPM_AUTH_KEY_0: 0x90
+Mar 01 17:45:21 k8sp.modernhackers.com kernel: iwlwifi 0000:04:00.0: CNVI_SCU_SEQ_DATA_DW9: 0x0
+Mar 01 17:45:21 k8sp.modernhackers.com kernel: iwlwifi 0000:04:00.0: Detected RF GF, rfid=0x10d000
+Mar 01 17:45:21 k8sp.modernhackers.com kernel: iwlwifi 0000:04:00.0: base HW address: f4:ce:23:05:b6:a3
+Mar 01 17:45:21 k8sp.modernhackers.com kernel: iwlwifi 0000:04:00.0 wlp4s0: renamed from wlan0
+Mar 01 17:45:22 k8sp.modernhackers.com kernel: kauditd_printk_skb: 14 callbacks suppressed
+Mar 01 17:45:22 k8sp.modernhackers.com kernel: audit: type=1130 audit(1772387122.357:25): pid=1 uid=0 auid=4294967295 ses=4294967295 subj=kernel msg='unit=systemd-userdb-load-credentials comm="systemd" exe="/us>
+Mar 01 17:45:22 k8sp.modernhackers.com kernel: audit: type=1130 audit(1772387122.363:26): pid=1 uid=0 auid=4294967295 ses=4294967295 subj=kernel msg='unit=plymouth-read-write comm="systemd" exe="/usr/lib/system>
+Mar 01 17:45:22 k8sp.modernhackers.com kernel: audit: type=1130 audit(1772387122.426:27): pid=1 uid=0 auid=4294967295 ses=4294967295 subj=kernel msg='unit=systemd-tmpfiles-setup comm="systemd" exe="/usr/lib/sys>
+Mar 01 17:45:22 k8sp.modernhackers.com kernel: audit: type=1334 audit(1772387122.432:28): prog-id=59 op=LOAD
+Mar 01 17:45:22 k8sp.modernhackers.com kernel: audit: type=1305 audit(1772387122.446:29): op=set audit_enabled=1 old=1 auid=4294967295 ses=4294967295 subj=kernel res=1
+Mar 01 17:45:22 k8sp.modernhackers.com kernel: audit: type=1300 audit(1772387122.446:29): arch=c000003e syscall=44 success=yes exit=60 a0=3 a1=7fff2c3a0180 a2=3c a3=0 items=0 ppid=1113 pid=1118 auid=4294967295 >
+Mar 01 17:45:22 k8sp.modernhackers.com kernel: audit: type=1327 audit(1772387122.446:29): proctitle="/usr/bin/auditd"
+Mar 01 17:45:22 k8sp.modernhackers.com kernel: RPC: Registered named UNIX socket transport module.
+Mar 01 17:45:22 k8sp.modernhackers.com kernel: RPC: Registered udp transport module.
+Mar 01 17:45:22 k8sp.modernhackers.com kernel: RPC: Registered tcp transport module.
+Mar 01 17:45:22 k8sp.modernhackers.com kernel: RPC: Registered tcp-with-tls transport module.
+Mar 01 17:45:22 k8sp.modernhackers.com kernel: RPC: Registered tcp NFSv4.1 backchannel transport module.
+Mar 01 17:45:22 k8sp.modernhackers.com kernel: [drm] Initialized nvidia-drm 0.0.0 for 0000:0a:00.0 on minor 1
+Mar 01 17:45:22 k8sp.modernhackers.com kernel: Console: switching to colour dummy device 80x25
+Mar 01 17:45:22 k8sp.modernhackers.com kernel: nvidia 0000:0a:00.0: vgaarb: deactivate vga console
+Mar 01 17:45:22 k8sp.modernhackers.com kernel: Bluetooth: BNEP (Ethernet Emulation) ver 1.3
+Mar 01 17:45:22 k8sp.modernhackers.com kernel: Bluetooth: BNEP filters: protocol multicast
+Mar 01 17:45:22 k8sp.modernhackers.com kernel: Bluetooth: BNEP socket layer initialized
+Mar 01 17:45:22 k8sp.modernhackers.com kernel: Bluetooth: MGMT ver 1.23
+Mar 01 17:45:22 k8sp.modernhackers.com kernel: nvme nvme0: using unchecked data buffer
+Mar 01 17:45:22 k8sp.modernhackers.com kernel: block nvme0n1: No UUID available providing old NGUID
+Mar 01 17:45:22 k8sp.modernhackers.com kernel: NET: Registered PF_QIPCRTR protocol family
+Mar 01 17:45:22 k8sp.modernhackers.com kernel: fbcon: nvidia-drmdrmfb (fb0) is primary device
+Mar 01 17:45:22 k8sp.modernhackers.com kernel: iwlwifi 0000:04:00.0: WFPM_UMAC_PD_NOTIFICATION: 0x20
+Mar 01 17:45:22 k8sp.modernhackers.com kernel: iwlwifi 0000:04:00.0: WFPM_LMAC2_PD_NOTIFICATION: 0x1f
+Mar 01 17:45:22 k8sp.modernhackers.com kernel: iwlwifi 0000:04:00.0: WFPM_AUTH_KEY_0: 0x90
+Mar 01 17:45:22 k8sp.modernhackers.com kernel: iwlwifi 0000:04:00.0: CNVI_SCU_SEQ_DATA_DW9: 0x0
+Mar 01 17:45:23 k8sp.modernhackers.com kernel: Console: switching to colour frame buffer device 240x67
+Mar 01 17:45:23 k8sp.modernhackers.com kernel: nvidia 0000:0a:00.0: [drm] fb0: nvidia-drmdrmfb frame buffer device
+Mar 01 17:45:23 k8sp.modernhackers.com kernel: iwlwifi 0000:04:00.0: WFPM_UMAC_PD_NOTIFICATION: 0x20
+Mar 01 17:45:23 k8sp.modernhackers.com kernel: iwlwifi 0000:04:00.0: WFPM_LMAC2_PD_NOTIFICATION: 0x1f
+Mar 01 17:45:23 k8sp.modernhackers.com kernel: iwlwifi 0000:04:00.0: WFPM_AUTH_KEY_0: 0x90
+Mar 01 17:45:23 k8sp.modernhackers.com kernel: iwlwifi 0000:04:00.0: CNVI_SCU_SEQ_DATA_DW9: 0x0
+Mar 01 17:45:26 k8sp.modernhackers.com kernel: wlp4s0: authenticate with 74:12:13:1f:ca:11 (local address=ae:ee:82:d2:38:fa)
+Mar 01 17:45:26 k8sp.modernhackers.com kernel: wlp4s0: send auth to 74:12:13:1f:ca:11 (try 1/3)
+Mar 01 17:45:26 k8sp.modernhackers.com kernel: wlp4s0: authenticated
+Mar 01 17:45:26 k8sp.modernhackers.com kernel: wlp4s0: associate with 74:12:13:1f:ca:11 (try 1/3)
+Mar 01 17:45:26 k8sp.modernhackers.com kernel: wlp4s0: RX AssocResp from 74:12:13:1f:ca:11 (capab=0x1431 status=0 aid=1)
+Mar 01 17:45:26 k8sp.modernhackers.com kernel: wlp4s0: associated
+Mar 01 17:45:29 k8sp.modernhackers.com kernel: netfs: FS-Cache loaded
+Mar 01 17:45:29 k8sp.modernhackers.com kernel: Key type dns_resolver registered
+Mar 01 17:45:29 k8sp.modernhackers.com kernel: Key type cifs.spnego registered
+Mar 01 17:45:29 k8sp.modernhackers.com kernel: Key type cifs.idmap registered
+Mar 01 17:45:29 k8sp.modernhackers.com kernel: CIFS: enabling forceuid mount option implicitly because uid= option is specified
+Mar 01 17:45:29 k8sp.modernhackers.com kernel: CIFS: enabling forcegid mount option implicitly because gid= option is specified
+Mar 01 17:45:29 k8sp.modernhackers.com kernel: CIFS: Attempting to mount //192.168.2.5/music
+Mar 01 17:45:29 k8sp.modernhackers.com kernel: CIFS: enabling forceuid mount option implicitly because uid= option is specified
+Mar 01 17:45:29 k8sp.modernhackers.com kernel: CIFS: enabling forcegid mount option implicitly because gid= option is specified
+Mar 01 17:45:29 k8sp.modernhackers.com kernel: CIFS: enabling forceuid mount option implicitly because uid= option is specified
+Mar 01 17:45:29 k8sp.modernhackers.com kernel: CIFS: enabling forcegid mount option implicitly because gid= option is specified
+Mar 01 17:45:29 k8sp.modernhackers.com kernel: CIFS: enabling forceuid mount option implicitly because uid= option is specified
+Mar 01 17:45:29 k8sp.modernhackers.com kernel: CIFS: enabling forcegid mount option implicitly because gid= option is specified
+Mar 01 17:45:29 k8sp.modernhackers.com kernel: CIFS: enabling forceuid mount option implicitly because uid= option is specified
+Mar 01 17:45:29 k8sp.modernhackers.com kernel: CIFS: enabling forceuid mount option implicitly because uid= option is specified
+Mar 01 17:45:29 k8sp.modernhackers.com kernel: CIFS: enabling forcegid mount option implicitly because gid= option is specified
+Mar 01 17:45:29 k8sp.modernhackers.com kernel: CIFS: enabling forcegid mount option implicitly because gid= option is specified
+Mar 01 17:45:30 k8sp.modernhackers.com kernel: CIFS: Attempting to mount //192.168.2.5/dokumentumok
+Mar 01 17:45:30 k8sp.modernhackers.com kernel: CIFS: Attempting to mount //192.168.2.5/fw
+Mar 01 17:45:30 k8sp.modernhackers.com kernel: CIFS: Attempting to mount //192.168.2.5/photo
+Mar 01 17:45:31 k8sp.modernhackers.com kernel: CIFS: Attempting to mount //192.168.2.5/torrent
+Mar 01 17:45:31 k8sp.modernhackers.com kernel: CIFS: Attempting to mount //192.168.2.5/programok
+Mar 01 17:45:32 k8sp.modernhackers.com kernel: Bluetooth: RFCOMM TTY layer initialized
+Mar 01 17:45:32 k8sp.modernhackers.com kernel: Bluetooth: RFCOMM socket layer initialized
+Mar 01 17:45:32 k8sp.modernhackers.com kernel: Bluetooth: RFCOMM ver 1.11
+Mar 01 17:45:33 k8sp.modernhackers.com kernel: rfkill: input handler disabled
+Mar 01 17:45:34 k8sp.modernhackers.com kernel: ------------[ cut here ]------------
+Mar 01 17:45:34 k8sp.modernhackers.com kernel: WARNING: CPU: 6 PID: 2772 at kernel/rcu/tasks.h:1995 exit_tasks_rcu_finish+0xff/0x130
+Mar 01 17:45:34 k8sp.modernhackers.com kernel: Modules linked in: nvidia_uvm(OE+) rfcomm snd_seq_dummy snd_hrtimer xt_conntrack nf_conntrack nf_defrag_ipv6 nf_defrag_ipv4 xt_comment nft_compat nls_utf8 nf_table>
+Mar 01 17:45:34 k8sp.modernhackers.com kernel:  vfio_iommu_type1 vfio iommufd br_netfilter bridge stp llc overlay i2c_dev fuse
+Mar 01 17:45:34 k8sp.modernhackers.com kernel: CPU: 6 UID: 0 PID: 2772 Comm: systemd-userwor Tainted: G           OE       6.18.9-200.fc43.x86_64 #1 PREEMPT(lazy) 
+Mar 01 17:45:34 k8sp.modernhackers.com kernel: Tainted: [O]=OOT_MODULE, [E]=UNSIGNED_MODULE
+Mar 01 17:45:34 k8sp.modernhackers.com kernel: Hardware name: To Be Filled By O.E.M. X570 Phantom Gaming 4/X570 Phantom Gaming 4, BIOS P5.60 01/18/2024
+Mar 01 17:45:34 k8sp.modernhackers.com kernel: RIP: 0010:exit_tasks_rcu_finish+0xff/0x130
+Mar 01 17:45:34 k8sp.modernhackers.com kernel: Code: 83 c4 08 48 89 df 5b 5d 41 5c 41 5d e9 6a ee ff ff c7 83 98 09 00 00 00 00 00 00 48 83 c4 08 5b 5d 41 5c 41 5d e9 e1 98 11 01 <0f> 0b eb ba 0f 0b e9 28 ff ff>
+Mar 01 17:45:34 k8sp.modernhackers.com kernel: RSP: 0018:ffffcd32c64ffb70 EFLAGS: 00010202
+Mar 01 17:45:34 k8sp.modernhackers.com kernel: RAX: 0000000000000040 RBX: ffff8a84971a2a40 RCX: 0000000000000001
+Mar 01 17:45:34 k8sp.modernhackers.com kernel: RDX: 0000000000000002 RSI: 0000000000000283 RDI: ffff8aa08e91d8b8
+Mar 01 17:45:34 k8sp.modernhackers.com kernel: RBP: ffff8aa08e91d8b8 R08: ffff8aa08e933c00 R09: ffff8a81d89e08c0
+Mar 01 17:45:34 k8sp.modernhackers.com kernel: R10: 0000000000000001 R11: 0000000000000000 R12: ffff8a84971a33c8
+Mar 01 17:45:34 k8sp.modernhackers.com kernel: R13: 0000000000000283 R14: 0000000000000000 R15: 0000000000000000
+Mar 01 17:45:34 k8sp.modernhackers.com kernel: FS:  0000000000000000(0000) GS:ffff8aa0d4326000(0000) knlGS:0000000000000000
+Mar 01 17:45:34 k8sp.modernhackers.com kernel: CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+Mar 01 17:45:34 k8sp.modernhackers.com kernel: CR2: 00007fd81152f4f8 CR3: 0000001daaa2e000 CR4: 0000000000350ef0
+Mar 01 17:45:34 k8sp.modernhackers.com kernel: Call Trace:
+Mar 01 17:45:34 k8sp.modernhackers.com kernel:  <TASK>
+Mar 01 17:45:34 k8sp.modernhackers.com kernel:  do_exit+0x2ae/0x440
+Mar 01 17:45:34 k8sp.modernhackers.com kernel:  do_group_exit+0x2d/0xc0
+Mar 01 17:45:34 k8sp.modernhackers.com kernel:  __x64_sys_exit_group+0x18/0x20
+Mar 01 17:45:34 k8sp.modernhackers.com kernel:  x64_sys_call+0x14fa/0x1500
+Mar 01 17:45:34 k8sp.modernhackers.com kernel:  do_syscall_64+0x7e/0x7f0
+Mar 01 17:45:34 k8sp.modernhackers.com kernel:  ? srso_return_thunk+0x5/0x5f
+Mar 01 17:45:34 k8sp.modernhackers.com kernel:  ? srso_return_thunk+0x5/0x5f
+Mar 01 17:45:34 k8sp.modernhackers.com kernel:  ? xas_find+0x83/0x1b0
+Mar 01 17:45:34 k8sp.modernhackers.com kernel:  ? srso_return_thunk+0x5/0x5f
+Mar 01 17:45:34 k8sp.modernhackers.com kernel:  ? srso_return_thunk+0x5/0x5f
+Mar 01 17:45:34 k8sp.modernhackers.com kernel:  ? next_uptodate_folio+0xa0/0x350
+Mar 01 17:45:34 k8sp.modernhackers.com kernel:  ? srso_return_thunk+0x5/0x5f
+Mar 01 17:45:34 k8sp.modernhackers.com kernel:  ? percpu_counter_add_batch+0x4a/0xb0
+Mar 01 17:45:34 k8sp.modernhackers.com kernel:  ? srso_return_thunk+0x5/0x5f
+Mar 01 17:45:34 k8sp.modernhackers.com kernel:  ? filemap_map_pages+0x2df/0x400
+Mar 01 17:45:34 k8sp.modernhackers.com kernel:  ? srso_return_thunk+0x5/0x5f
+Mar 01 17:45:34 k8sp.modernhackers.com kernel:  ? do_read_fault+0x107/0x260
+Mar 01 17:45:34 k8sp.modernhackers.com kernel:  ? srso_return_thunk+0x5/0x5f
+Mar 01 17:45:34 k8sp.modernhackers.com kernel:  ? handle_pte_fault+0x118/0x230
+Mar 01 17:45:34 k8sp.modernhackers.com kernel:  ? srso_return_thunk+0x5/0x5f
+Mar 01 17:45:34 k8sp.modernhackers.com kernel:  ? do_fault+0x16b/0x260
+Mar 01 17:45:34 k8sp.modernhackers.com kernel:  ? srso_return_thunk+0x5/0x5f
+Mar 01 17:45:34 k8sp.modernhackers.com kernel:  ? __handle_mm_fault+0x551/0x6a0
+Mar 01 17:45:34 k8sp.modernhackers.com kernel:  ? srso_return_thunk+0x5/0x5f
+Mar 01 17:45:34 k8sp.modernhackers.com kernel:  ? count_memcg_events+0xd6/0x220
+Mar 01 17:45:34 k8sp.modernhackers.com kernel:  ? srso_return_thunk+0x5/0x5f
+Mar 01 17:45:34 k8sp.modernhackers.com kernel:  ? handle_mm_fault+0x248/0x360
+Mar 01 17:45:34 k8sp.modernhackers.com kernel:  ? srso_return_thunk+0x5/0x5f
+Mar 01 17:45:34 k8sp.modernhackers.com kernel:  ? do_user_addr_fault+0x21a/0x690
+Mar 01 17:45:34 k8sp.modernhackers.com kernel:  ? srso_return_thunk+0x5/0x5f
+Mar 01 17:45:34 k8sp.modernhackers.com kernel:  ? srso_return_thunk+0x5/0x5f
+Mar 01 17:45:34 k8sp.modernhackers.com kernel:  ? irqentry_exit_to_user_mode+0x2c/0x1c0
+Mar 01 17:45:34 k8sp.modernhackers.com kernel:  entry_SYSCALL_64_after_hwframe+0x76/0x7e
+Mar 01 17:45:34 k8sp.modernhackers.com kernel: RIP: 0033:0x7fd811ccd048
+Mar 01 17:45:34 k8sp.modernhackers.com kernel: Code: Unable to access opcode bytes at 0x7fd811ccd01e.
+Mar 01 17:45:34 k8sp.modernhackers.com kernel: RSP: 002b:00007ffc63260fc8 EFLAGS: 00000206 ORIG_RAX: 00000000000000e7
+Mar 01 17:45:34 k8sp.modernhackers.com kernel: RAX: ffffffffffffffda RBX: 00007fd811df7fc8 RCX: 00007fd811ccd048
+Mar 01 17:45:34 k8sp.modernhackers.com kernel: RDX: 00007fd811b45ec8 RSI: fffffffffffffe78 RDI: 0000000000000000
+Mar 01 17:45:34 k8sp.modernhackers.com kernel: RBP: 00007ffc63261020 R08: 0000000000000000 R09: 0000000000000020
+Mar 01 17:45:34 k8sp.modernhackers.com kernel: R10: 00007ffc63260d40 R11: 0000000000000206 R12: 0000000000000001
+Mar 01 17:45:34 k8sp.modernhackers.com kernel: R13: 0000000000000000 R14: 00007fd811df6680 R15: 00007fd811df7fe0
+Mar 01 17:45:34 k8sp.modernhackers.com kernel:  </TASK>
+Mar 01 17:45:34 k8sp.modernhackers.com kernel: ---[ end trace 0000000000000000 ]---
+Mar 01 17:45:34 k8sp.modernhackers.com kernel: ------------[ cut here ]------------
+Mar 01 17:45:34 k8sp.modernhackers.com kernel: WARNING: CPU: 6 PID: 2772 at kernel/rcu/tasks.h:1996 exit_tasks_rcu_finish+0xd2/0x130
+Mar 01 17:45:34 k8sp.modernhackers.com kernel: Modules linked in: nvidia_uvm(OE+) rfcomm snd_seq_dummy snd_hrtimer xt_conntrack nf_conntrack nf_defrag_ipv6 nf_defrag_ipv4 xt_comment nft_compat nls_utf8 nf_table>
+Mar 01 17:45:34 k8sp.modernhackers.com kernel:  vfio_iommu_type1 vfio iommufd br_netfilter bridge stp llc overlay i2c_dev fuse
+Mar 01 17:45:34 k8sp.modernhackers.com kernel: CPU: 6 UID: 0 PID: 2772 Comm: systemd-userwor Tainted: G        W  OE       6.18.9-200.fc43.x86_64 #1 PREEMPT(lazy) 
+Mar 01 17:45:34 k8sp.modernhackers.com kernel: Tainted: [W]=WARN, [O]=OOT_MODULE, [E]=UNSIGNED_MODULE
+Mar 01 17:45:34 k8sp.modernhackers.com kernel: Hardware name: To Be Filled By O.E.M. X570 Phantom Gaming 4/X570 Phantom Gaming 4, BIOS P5.60 01/18/2024
+Mar 01 17:45:34 k8sp.modernhackers.com kernel: RIP: 0010:exit_tasks_rcu_finish+0xd2/0x130
+Mar 01 17:45:34 k8sp.modernhackers.com kernel: Code: 00 00 00 f0 0f b0 93 a1 09 00 00 8b 83 98 09 00 00 85 c0 75 42 f0 83 44 24 fc 00 0f b6 83 a1 09 00 00 a8 01 75 04 84 c9 74 14 <0f> 0b 48 83 c4 08 48 89 df 5b>
+Mar 01 17:45:34 k8sp.modernhackers.com kernel: RSP: 0018:ffffcd32c64ffb70 EFLAGS: 00010202
+Mar 01 17:45:34 k8sp.modernhackers.com kernel: RAX: 0000000000000002 RBX: ffff8a84971a2a40 RCX: 0000000000000001
+Mar 01 17:45:34 k8sp.modernhackers.com kernel: RDX: 0000000000000002 RSI: 0000000000000283 RDI: ffff8aa08e91d8b8
+Mar 01 17:45:34 k8sp.modernhackers.com kernel: RBP: ffff8aa08e91d8b8 R08: ffff8aa08e933c00 R09: ffff8a81d89e08c0
+Mar 01 17:45:34 k8sp.modernhackers.com kernel: R10: 0000000000000001 R11: 0000000000000000 R12: ffff8a84971a33c8
+Mar 01 17:45:34 k8sp.modernhackers.com kernel: R13: 0000000000000283 R14: 0000000000000000 R15: 0000000000000000
+Mar 01 17:45:34 k8sp.modernhackers.com kernel: FS:  0000000000000000(0000) GS:ffff8aa0d4326000(0000) knlGS:0000000000000000
+Mar 01 17:45:34 k8sp.modernhackers.com kernel: CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+Mar 01 17:45:34 k8sp.modernhackers.com kernel: CR2: 00007fd81152f4f8 CR3: 0000001daaa2e000 CR4: 0000000000350ef0
+Mar 01 17:45:34 k8sp.modernhackers.com kernel: Call Trace:
+Mar 01 17:45:34 k8sp.modernhackers.com kernel:  <TASK>
+Mar 01 17:45:34 k8sp.modernhackers.com kernel:  do_exit+0x2ae/0x440
+Mar 01 17:45:34 k8sp.modernhackers.com kernel:  do_group_exit+0x2d/0xc0
+Mar 01 17:45:34 k8sp.modernhackers.com kernel:  __x64_sys_exit_group+0x18/0x20
+Mar 01 17:45:34 k8sp.modernhackers.com kernel:  x64_sys_call+0x14fa/0x1500
+Mar 01 17:45:34 k8sp.modernhackers.com kernel:  do_syscall_64+0x7e/0x7f0
+Mar 01 17:45:34 k8sp.modernhackers.com kernel:  ? srso_return_thunk+0x5/0x5f
+Mar 01 17:45:34 k8sp.modernhackers.com kernel:  ? srso_return_thunk+0x5/0x5f
+Mar 01 17:45:34 k8sp.modernhackers.com kernel:  ? xas_find+0x83/0x1b0
+Mar 01 17:45:34 k8sp.modernhackers.com kernel:  ? srso_return_thunk+0x5/0x5f
+Mar 01 17:45:34 k8sp.modernhackers.com kernel:  ? srso_return_thunk+0x5/0x5f
+Mar 01 17:45:34 k8sp.modernhackers.com kernel:  ? next_uptodate_folio+0xa0/0x350
+Mar 01 17:45:34 k8sp.modernhackers.com kernel:  ? srso_return_thunk+0x5/0x5f
+Mar 01 17:45:34 k8sp.modernhackers.com kernel:  ? percpu_counter_add_batch+0x4a/0xb0
+Mar 01 17:45:34 k8sp.modernhackers.com kernel:  ? srso_return_thunk+0x5/0x5f
+Mar 01 17:45:34 k8sp.modernhackers.com kernel:  ? filemap_map_pages+0x2df/0x400
+Mar 01 17:45:34 k8sp.modernhackers.com kernel:  ? srso_return_thunk+0x5/0x5f
+Mar 01 17:45:34 k8sp.modernhackers.com kernel:  ? do_read_fault+0x107/0x260
+Mar 01 17:45:34 k8sp.modernhackers.com kernel:  ? srso_return_thunk+0x5/0x5f
+Mar 01 17:45:34 k8sp.modernhackers.com kernel:  ? handle_pte_fault+0x118/0x230
+Mar 01 17:45:34 k8sp.modernhackers.com kernel:  ? srso_return_thunk+0x5/0x5f
+Mar 01 17:45:34 k8sp.modernhackers.com kernel:  ? do_fault+0x16b/0x260
+Mar 01 17:45:34 k8sp.modernhackers.com kernel:  ? srso_return_thunk+0x5/0x5f
+Mar 01 17:45:34 k8sp.modernhackers.com kernel:  ? __handle_mm_fault+0x551/0x6a0
+Mar 01 17:45:34 k8sp.modernhackers.com kernel:  ? srso_return_thunk+0x5/0x5f
+Mar 01 17:45:34 k8sp.modernhackers.com kernel:  ? count_memcg_events+0xd6/0x220
+Mar 01 17:45:34 k8sp.modernhackers.com kernel:  ? srso_return_thunk+0x5/0x5f
+Mar 01 17:45:34 k8sp.modernhackers.com kernel:  ? handle_mm_fault+0x248/0x360
+Mar 01 17:45:34 k8sp.modernhackers.com kernel:  ? srso_return_thunk+0x5/0x5f
+Mar 01 17:45:34 k8sp.modernhackers.com kernel:  ? do_user_addr_fault+0x21a/0x690
+Mar 01 17:45:34 k8sp.modernhackers.com kernel:  ? srso_return_thunk+0x5/0x5f
+Mar 01 17:45:34 k8sp.modernhackers.com kernel:  ? srso_return_thunk+0x5/0x5f
+Mar 01 17:45:34 k8sp.modernhackers.com kernel:  ? irqentry_exit_to_user_mode+0x2c/0x1c0
+Mar 01 17:45:34 k8sp.modernhackers.com kernel:  entry_SYSCALL_64_after_hwframe+0x76/0x7e
+Mar 01 17:45:34 k8sp.modernhackers.com kernel: RIP: 0033:0x7fd811ccd048
+Mar 01 17:45:34 k8sp.modernhackers.com kernel: Code: Unable to access opcode bytes at 0x7fd811ccd01e.
+Mar 01 17:45:34 k8sp.modernhackers.com kernel: RSP: 002b:00007ffc63260fc8 EFLAGS: 00000206 ORIG_RAX: 00000000000000e7
+Mar 01 17:45:34 k8sp.modernhackers.com kernel: RAX: ffffffffffffffda RBX: 00007fd811df7fc8 RCX: 00007fd811ccd048
+Mar 01 17:45:34 k8sp.modernhackers.com kernel: RDX: 00007fd811b45ec8 RSI: fffffffffffffe78 RDI: 0000000000000000
+Mar 01 17:45:34 k8sp.modernhackers.com kernel: RBP: 00007ffc63261020 R08: 0000000000000000 R09: 0000000000000020
+Mar 01 17:45:34 k8sp.modernhackers.com kernel: R10: 00007ffc63260d40 R11: 0000000000000206 R12: 0000000000000001
+Mar 01 17:45:34 k8sp.modernhackers.com kernel: R13: 0000000000000000 R14: 00007fd811df6680 R15: 00007fd811df7fe0
+Mar 01 17:45:34 k8sp.modernhackers.com kernel:  </TASK>
+Mar 01 17:45:34 k8sp.modernhackers.com kernel: ---[ end trace 0000000000000000 ]---
+Mar 01 17:45:37 k8sp.modernhackers.com systemd-journald[771]: File /var/log/journal/9ed095e4ef1443f5a74fc8038dba4de9/user-1000.journal corrupted or uncleanly shut down, renaming and replacing.
+Mar 01 17:45:38 k8sp.modernhackers.com kernel: rfkill: input handler enabled
+Mar 01 17:45:39 k8sp.modernhackers.com kernel: rfkill: input handler disabled
+Mar 01 17:45:40 k8sp.modernhackers.com kernel: FAT-fs (sde1): Volume was not properly unmounted. Some data may be corrupt. Please run fsck.
+Mar 01 17:45:47 k8sp.modernhackers.com kernel: evm: overlay not supported
+Mar 01 17:50:33 k8sp.modernhackers.com kernel: wlp4s0: disconnect from AP 74:12:13:1f:ca:11 for new auth to 74:12:13:1f:ca:12
+Mar 01 17:50:33 k8sp.modernhackers.com kernel: wlp4s0: authenticate with 74:12:13:1f:ca:12 (local address=ae:ee:82:d2:38:fa)
+Mar 01 17:50:33 k8sp.modernhackers.com kernel: wlp4s0: send auth to 74:12:13:1f:ca:12 (try 1/3)
+Mar 01 17:50:33 k8sp.modernhackers.com kernel: wlp4s0: authenticated
+Mar 01 17:50:33 k8sp.modernhackers.com kernel: wlp4s0: associate with 74:12:13:1f:ca:12 (try 1/3)
+Mar 01 17:50:34 k8sp.modernhackers.com kernel: wlp4s0: RX ReassocResp from 74:12:13:1f:ca:12 (capab=0x1511 status=0 aid=5)
+Mar 01 17:50:34 k8sp.modernhackers.com kernel: wlp4s0: associated
+Mar 01 17:59:33 k8sp.modernhackers.com kernel: BTRFS info (device nvme0n1p3): scrub: started on devid 1
+Mar 01 18:00:18 k8sp.modernhackers.com kernel: BTRFS info (device nvme0n1p3): scrub: not finished on devid 1 with status: -125
+Mar 01 18:01:48 k8sp.modernhackers.com kernel: BTRFS warning (device nvme0n1p3): csum failed root 256 ino 380804 off 188727296 csum 0x424cd058 expected csum 0x8941f998 mirror 1
+Mar 01 18:01:48 k8sp.modernhackers.com kernel: BTRFS error (device nvme0n1p3): bdev /dev/nvme0n1p3 errs: wr 0, rd 0, flush 0, corrupt 61, gen 0
+Mar 01 18:01:48 k8sp.modernhackers.com kernel: BTRFS warning (device nvme0n1p3): csum failed root 256 ino 380804 off 188727296 csum 0xc8b6086f expected csum 0x8941f998 mirror 1
+Mar 01 18:01:48 k8sp.modernhackers.com kernel: BTRFS error (device nvme0n1p3): bdev /dev/nvme0n1p3 errs: wr 0, rd 0, flush 0, corrupt 62, gen 0
+Mar 01 18:01:48 k8sp.modernhackers.com kernel: BTRFS warning (device nvme0n1p3): csum failed root 256 ino 380804 off 188727296 csum 0xd9fd79a7 expected csum 0x8941f998 mirror 1
+Mar 01 18:01:48 k8sp.modernhackers.com kernel: BTRFS error (device nvme0n1p3): bdev /dev/nvme0n1p3 errs: wr 0, rd 0, flush 0, corrupt 63, gen 0
+Mar 01 18:01:48 k8sp.modernhackers.com kernel: BTRFS warning (device nvme0n1p3): csum failed root 256 ino 380804 off 188727296 csum 0xd9fd79a7 expected csum 0x8941f998 mirror 1
+Mar 01 18:01:48 k8sp.modernhackers.com kernel: BTRFS error (device nvme0n1p3): bdev /dev/nvme0n1p3 errs: wr 0, rd 0, flush 0, corrupt 64, gen 0
+Mar 01 18:01:48 k8sp.modernhackers.com kernel: BTRFS warning (device nvme0n1p3): csum failed root 256 ino 380804 off 188727296 csum 0xd9fd79a7 expected csum 0x8941f998 mirror 1
+Mar 01 18:01:48 k8sp.modernhackers.com kernel: BTRFS error (device nvme0n1p3): bdev /dev/nvme0n1p3 errs: wr 0, rd 0, flush 0, corrupt 65, gen 0
+Mar 01 18:02:01 k8sp.modernhackers.com kernel: BTRFS warning (device nvme0n1p3): csum failed root 256 ino 380804 off 188727296 csum 0xd9fd79a7 expected csum 0x8941f998 mirror 1
+Mar 01 18:02:01 k8sp.modernhackers.com kernel: BTRFS error (device nvme0n1p3): bdev /dev/nvme0n1p3 errs: wr 0, rd 0, flush 0, corrupt 66, gen 0
+Mar 01 18:02:01 k8sp.modernhackers.com kernel: BTRFS warning (device nvme0n1p3): csum failed root 256 ino 380804 off 188727296 csum 0xd9fd79a7 expected csum 0x8941f998 mirror 1
+Mar 01 18:02:01 k8sp.modernhackers.com kernel: BTRFS error (device nvme0n1p3): bdev /dev/nvme0n1p3 errs: wr 0, rd 0, flush 0, corrupt 67, gen 0
+Mar 01 18:02:01 k8sp.modernhackers.com kernel: BTRFS warning (device nvme0n1p3): csum failed root 256 ino 380804 off 188727296 csum 0xd9fd79a7 expected csum 0x8941f998 mirror 1
+Mar 01 18:02:01 k8sp.modernhackers.com kernel: BTRFS error (device nvme0n1p3): bdev /dev/nvme0n1p3 errs: wr 0, rd 0, flush 0, corrupt 68, gen 0
+Mar 01 18:02:01 k8sp.modernhackers.com kernel: BTRFS warning (device nvme0n1p3): csum failed root 256 ino 380804 off 188727296 csum 0xd9fd79a7 expected csum 0x8941f998 mirror 1
+Mar 01 18:02:01 k8sp.modernhackers.com kernel: BTRFS error (device nvme0n1p3): bdev /dev/nvme0n1p3 errs: wr 0, rd 0, flush 0, corrupt 69, gen 0
+Mar 01 18:02:11 k8sp.modernhackers.com kernel: BTRFS warning (device nvme0n1p3): csum failed root 256 ino 380804 off 188727296 csum 0xd9fd79a7 expected csum 0x8941f998 mirror 1
+Mar 01 18:02:11 k8sp.modernhackers.com kernel: BTRFS error (device nvme0n1p3): bdev /dev/nvme0n1p3 errs: wr 0, rd 0, flush 0, corrupt 70, gen 0
+Mar 01 18:02:11 k8sp.modernhackers.com kernel: BTRFS warning (device nvme0n1p3): csum failed root 256 ino 380804 off 188727296 csum 0xd9fd79a7 expected csum 0x8941f998 mirror 1
+Mar 01 18:02:11 k8sp.modernhackers.com kernel: BTRFS error (device nvme0n1p3): bdev /dev/nvme0n1p3 errs: wr 0, rd 0, flush 0, corrupt 71, gen 0
+Mar 01 18:02:11 k8sp.modernhackers.com kernel: BTRFS warning (device nvme0n1p3): csum failed root 256 ino 380804 off 188727296 csum 0xd9fd79a7 expected csum 0x8941f998 mirror 1
+Mar 01 18:02:11 k8sp.modernhackers.com kernel: BTRFS error (device nvme0n1p3): bdev /dev/nvme0n1p3 errs: wr 0, rd 0, flush 0, corrupt 72, gen 0
+Mar 01 18:02:11 k8sp.modernhackers.com kernel: BTRFS warning (device nvme0n1p3): csum failed root 256 ino 380804 off 188727296 csum 0xd9fd79a7 expected csum 0x8941f998 mirror 1
+Mar 01 18:02:11 k8sp.modernhackers.com kernel: BTRFS error (device nvme0n1p3): bdev /dev/nvme0n1p3 errs: wr 0, rd 0, flush 0, corrupt 73, gen 0
+Mar 01 18:02:21 k8sp.modernhackers.com kernel: BTRFS warning (device nvme0n1p3): csum failed root 256 ino 380804 off 188727296 csum 0xd9fd79a7 expected csum 0x8941f998 mirror 1
+Mar 01 18:02:21 k8sp.modernhackers.com kernel: BTRFS error (device nvme0n1p3): bdev /dev/nvme0n1p3 errs: wr 0, rd 0, flush 0, corrupt 74, gen 0
+Mar 01 18:02:21 k8sp.modernhackers.com kernel: BTRFS warning (device nvme0n1p3): csum failed root 256 ino 380804 off 188727296 csum 0x424cd058 expected csum 0x8941f998 mirror 1
+Mar 01 18:02:21 k8sp.modernhackers.com kernel: BTRFS error (device nvme0n1p3): bdev /dev/nvme0n1p3 errs: wr 0, rd 0, flush 0, corrupt 75, gen 0
+Mar 01 18:02:21 k8sp.modernhackers.com kernel: BTRFS warning (device nvme0n1p3): csum failed root 256 ino 380804 off 188727296 csum 0xd9fd79a7 expected csum 0x8941f998 mirror 1
+Mar 01 18:02:21 k8sp.modernhackers.com kernel: BTRFS error (device nvme0n1p3): bdev /dev/nvme0n1p3 errs: wr 0, rd 0, flush 0, corrupt 76, gen 0
+Mar 01 18:02:21 k8sp.modernhackers.com kernel: BTRFS warning (device nvme0n1p3): csum failed root 256 ino 380804 off 188727296 csum 0xd9fd79a7 expected csum 0x8941f998 mirror 1
+Mar 01 18:02:21 k8sp.modernhackers.com kernel: BTRFS error (device nvme0n1p3): bdev /dev/nvme0n1p3 errs: wr 0, rd 0, flush 0, corrupt 77, gen 0
+Mar 01 18:02:21 k8sp.modernhackers.com kernel: PK-Backend[12720]: segfault at 7fa4b43a6b0f ip 00007fa4bf6d503a sp 00007fa4be278230 error 4 in libsolv.so.1[7503a,7fa4bf660000+8a000] likely on CPU 0 (core 0, sock>
+Mar 01 18:02:21 k8sp.modernhackers.com kernel: Code: 44 8b 10 45 85 d2 0f 89 a1 00 00 00 8b 4b 10 41 8d 82 00 00 00 80 4d 8b 56 20 01 c1 89 ce 83 e1 07 c1 fe 03 48 63 f6 49 01 f2 <41> 0f b6 3a 0f a3 cf 89 fa 0f>
+Mar 01 18:03:28 k8sp.modernhackers.com kernel: BTRFS warning (device nvme0n1p3): csum failed root 256 ino 380804 off 188727296 csum 0xd9fd79a7 expected csum 0x8941f998 mirror 1
+Mar 01 18:03:28 k8sp.modernhackers.com kernel: BTRFS error (device nvme0n1p3): bdev /dev/nvme0n1p3 errs: wr 0, rd 0, flush 0, corrupt 78, gen 0
+Mar 01 18:03:28 k8sp.modernhackers.com kernel: BTRFS warning (device nvme0n1p3): csum failed root 256 ino 380804 off 188727296 csum 0xd9fd79a7 expected csum 0x8941f998 mirror 1
+Mar 01 18:03:28 k8sp.modernhackers.com kernel: BTRFS error (device nvme0n1p3): bdev /dev/nvme0n1p3 errs: wr 0, rd 0, flush 0, corrupt 79, gen 0
+Mar 01 18:03:28 k8sp.modernhackers.com kernel: BTRFS warning (device nvme0n1p3): csum failed root 256 ino 380804 off 188727296 csum 0xd9fd79a7 expected csum 0x8941f998 mirror 1
+Mar 01 18:03:28 k8sp.modernhackers.com kernel: BTRFS error (device nvme0n1p3): bdev /dev/nvme0n1p3 errs: wr 0, rd 0, flush 0, corrupt 80, gen 0
+Mar 01 18:03:28 k8sp.modernhackers.com kernel: BTRFS warning (device nvme0n1p3): csum failed root 256 ino 380804 off 188727296 csum 0xd9fd79a7 expected csum 0x8941f998 mirror 1
+Mar 01 18:03:28 k8sp.modernhackers.com kernel: BTRFS error (device nvme0n1p3): bdev /dev/nvme0n1p3 errs: wr 0, rd 0, flush 0, corrupt 81, gen 0
+Mar 01 18:03:41 k8sp.modernhackers.com kernel: BTRFS warning (device nvme0n1p3): csum failed root 256 ino 380804 off 188727296 csum 0xd9fd79a7 expected csum 0x8941f998 mirror 1
+Mar 01 18:03:41 k8sp.modernhackers.com kernel: BTRFS error (device nvme0n1p3): bdev /dev/nvme0n1p3 errs: wr 0, rd 0, flush 0, corrupt 82, gen 0
+Mar 01 18:03:41 k8sp.modernhackers.com kernel: BTRFS warning (device nvme0n1p3): csum failed root 256 ino 380804 off 188727296 csum 0xd9fd79a7 expected csum 0x8941f998 mirror 1
+Mar 01 18:03:41 k8sp.modernhackers.com kernel: BTRFS error (device nvme0n1p3): bdev /dev/nvme0n1p3 errs: wr 0, rd 0, flush 0, corrupt 83, gen 0
+Mar 01 18:03:41 k8sp.modernhackers.com kernel: BTRFS warning (device nvme0n1p3): csum failed root 256 ino 380804 off 188727296 csum 0xc8b6086f expected csum 0x8941f998 mirror 1
+Mar 01 18:03:41 k8sp.modernhackers.com kernel: BTRFS error (device nvme0n1p3): bdev /dev/nvme0n1p3 errs: wr 0, rd 0, flush 0, corrupt 84, gen 0
+Mar 01 18:07:01 k8sp.modernhackers.com kernel: input: Bose QC45 (AVRCP) as /devices/virtual/input/input25
+Mar 01 18:08:51 k8sp.modernhackers.com kernel: input: Bose QC45 (AVRCP) as /devices/virtual/input/input26
+
+Thanks, Peter — from the logs you’ve pasted, I can see the likely cause of the freeze/warning. Let me break it down clearly.
+
+1. The key error
+
+This is the critical section from your log:
+
+WARNING: CPU: 6 PID: 2772 at kernel/rcu/tasks.h:1995 exit_tasks_rcu_finish+0xff/0x130
+...
+Tainted: [O]=OOT_MODULE, [E]=UNSIGNED_MODULE
+RIP: 0010:exit_tasks_rcu_finish+0xff/0x130
+Call Trace:
+ do_exit+0x2ae/0x440
+ do_group_exit+0x2d/0xc0
+ __x64_sys_exit_group+0x18/0x20
+ ...
+What this means:
+
+exit_tasks_rcu_finish is part of the RCU (Read-Copy-Update) subsystem, which handles safe deletion of tasks in the kernel.
+
+A WARNING here indicates a kernel memory corruption risk or timing issue during task exit.
+
+Importantly, your kernel is tainted:
+
+Tainted: [O]=OOT_MODULE, [E]=UNSIGNED_MODULE
+
+[O] OOT_MODULE → you have an out-of-tree kernel module loaded. In your log, this is clearly the NVIDIA module (nvidia_uvm).
+
+[E] UNSIGNED_MODULE → module not signed, which is also a warning for kernel stability.
+
+2. Suspicious modules
+
+From your module list:
+
+Modules linked in: nvidia_uvm(OE+) rfcomm ...
+
+nvidia_uvm (the NVIDIA Unified Memory kernel module) is out-of-tree and unsigned.
+
+There are also vfio_iommu_type1 and vfio modules loaded — these interact with PCI devices (like your GPU) and can trigger RCU warnings if task exit happens concurrently with GPU driver operations.
+
+3. Likely scenario for freeze
+
+Given your setup:
+
+NVIDIA GPU is bound to vfio-pci (used for passthrough or virtualization).
+
+nvidia_uvm is loaded after VFIO has ownership of the device:
+
+NVRM: GPU 0000:03:00.0 is already bound to vfio-pci.
+
+This is a classic source of kernel warnings and freezes, because the NVIDIA driver assumes ownership of the GPU memory, but VFIO has it.
+
+The RCU warning occurs when a task exits while memory or GPU resources are being cleaned up by an out-of-tree module.
+
+4. Other clues
+
+Multiple CIFS mounts and iwlwifi operations in the log are normal — they are not crashing your kernel.
+
+Nothing indicates disk corruption or BTRFS issues here — your filesystem mounted fine:
+
+EXT4-fs (nvme0n1p2): mounted filesystem ... r/w with ordered data mode
+
+So the freeze is driver/module related, not disk or filesystem related.
+
+✅ Summary
+
+Cause: RCU warning in exit_tasks_rcu_finish triggered by out-of-tree, unsigned NVIDIA kernel module (nvidia_uvm), likely conflicting with vfio-pci.
+
+Effect: Can lead to system freeze or instability, especially under GPU passthrough or CUDA workloads.
+
+Not the root filesystem: Btrfs/ext4 are not implicated here.
+
+5. Suggested fixes
+
+Unload conflicting modules before loading NVIDIA:
+
+sudo modprobe -r nvidia_uvm
+sudo modprobe -r nvidia
+
+Make sure vfio-pci owns the GPU first if you’re using passthrough.
+
+Use DKMS or Fedora-provided NVIDIA drivers instead of manually compiled out-of-tree ones.
+
+Check kernel version compatibility: your kernel is 6.18.9-200.fc43.x86_64 — some NVIDIA versions have known RCU warnings here.
+
+Optionally disable preemption for testing (PREEMPT=lazy may contribute to timing issues with GPU drivers).
+
+If you want, I can write a ready-to-run one-liner that scans your Fedora journal and filters all NVIDIA/VFIO/RCU warnings from the last freeze, so you can monitor if this happens again.
+
+Do you want me to do that?
+
+howto use this??
+
+5. Suggested fixes
+
+Unload conflicting modules before loading NVIDIA:
+
+sudo modprobe -r nvidia_uvm
+sudo modprobe -r nvidia
+
+Ah, I see — the kernel logs you shared show that your NVIDIA GPU is being claimed by vfio-pci, which conflicts with the NVIDIA driver. That’s why the NVRM: The NVIDIA probe routine was not called for 1 device(s) warning appears.
+
+The suggestion to unload conflicting modules is essentially telling you to temporarily remove any kernel modules that might be “locking” the GPU before trying to load the official NVIDIA driver. Here’s how you can do it safely:
+
+1. Check which NVIDIA modules are loaded
+lsmod | grep nvidia
+
+You’ll likely see something like nvidia_uvm, nvidia, nvidia_drm, etc.
+
+2. Unload the NVIDIA modules
+
+Use modprobe -r to remove them in reverse dependency order:
+
+sudo modprobe -r nvidia_uvm
+sudo modprobe -r nvidia_drm
+sudo modprobe -r nvidia
+
+⚠️ Important: If any processes are using the GPU (like Xorg, Wayland, or a VM using GPU passthrough), the unload will fail. You may need to stop those services first:
+
+sudo systemctl stop gdm    # or lightdm/sddm depending on your display manager
+3. Load the NVIDIA driver again
+
+Once the conflicting modules are unloaded, you can load the NVIDIA driver:
+
+sudo modprobe nvidia
+sudo modprobe nvidia_uvm
+sudo modprobe nvidia_drm
+4. Verify the driver is loaded
+nvidia-smi
+
+If it shows your GPU with the correct driver, you’re good.
+
+5. Permanent fix for vfio-pci conflicts
+
+If you’re using GPU passthrough with VFIO, you cannot use the NVIDIA driver on that GPU at the same time. You have two options:
+
+Use the GPU exclusively with NVIDIA (remove it from VFIO passthrough).
+
+Keep it for VFIO (used by VMs) and don’t load NVIDIA driver for that device.
+
+If you want, I can give you an exact step-by-step command sequence that handles unloading everything safely and reloading the NVIDIA driver on your system. That avoids breaking your X server or VMs.
+
+Do you want me to do that?
+
+I have two nvidia cards, one assigned for vfio-pci
+
+Ah, perfect — that explains the exact issue in your logs. One of your NVIDIA cards is bound to vfio-pci for passthrough, and the other is “free” and intended for the host. The kernel is complaining because the NVIDIA driver sees a device already claimed by VFIO and refuses to touch it.
+
+Here’s the safe way to handle two cards:
+
+1. Identify which GPU is assigned to VFIO
+lspci -nn | grep -i nvidia
+
+You’ll see output like:
+
+03:00.0 VGA compatible controller [0300]: NVIDIA Device XXXX
+0a:00.0 VGA compatible controller [0300]: NVIDIA Device YYYY
+
+One of these should be bound to VFIO (the one for your VM). You can check:
+
+lspci -nnk -s 03:00.0   # Replace with the VFIO GPU
+
+Look for Kernel driver in use: vfio-pci.
+
+2. Make sure only the host GPU uses NVIDIA
+
+The other GPU should not be bound to VFIO. Check it:
+
+lspci -nnk -s 0a:00.0
+
+You should see Kernel driver in use: nvidia or none.
+
+3. Load NVIDIA modules only for the host GPU
+
+Now, safely load the NVIDIA driver without touching the VFIO GPU:
+
+sudo modprobe nvidia
+sudo modprobe nvidia_uvm
+sudo modprobe nvidia_drm
+
+You do not unload VFIO modules, because your passthrough GPU depends on them. The NVIDIA driver will ignore the GPU claimed by VFIO.
+
+4. Verify
+nvidia-smi
+
+It should show only the host GPU, not the passthrough one.
+
+5. Optional: Prevent accidental binding conflicts
+
+You can tell the NVIDIA driver to ignore the VFIO GPU explicitly by adding a kernel parameter for the VFIO GPU:
+
+Find the VFIO GPU PCI IDs:
+
+lspci -nn | grep -i nvidia
+
+Add nvidia_drm.modeset=1 and rd.driver.blacklist=vfio-pci:0000:03:00.0 (replace with your VFIO GPU ID) to your GRUB kernel parameters.
+
+This ensures your host NVIDIA driver never tries to claim the VFIO GPU.

@@ -7,13 +7,13 @@
     vault_metrics_token_resolved: >-
       {{
         (
-          vault_metrics_token | default('', true) | trim | regex_replace('^(?i)none$', '')
+          vault_metrics_token | default('', true) | trim | regex_replace('(?i)^none$', '')
         )
         or (
-          vault_token | default('', true) | trim | regex_replace('^(?i)none$', '')
+          vault_token | default('', true) | trim | regex_replace('(?i)^none$', '')
         )
         or (
-          lookup('file', '/root/.vault-token', errors='ignore') | default('') | trim | regex_replace('^(?i)none$', '')
+          lookup('file', '/root/.vault-token', errors='ignore') | default('') | trim | regex_replace('(?i)^none$', '')
         )
       }}
   when: vault_metrics_token | default('') | trim | length == 0
