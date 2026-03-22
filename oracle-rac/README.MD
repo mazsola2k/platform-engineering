@@ -4,6 +4,21 @@
 
 ---
 
+## Modernizing Oracle Infrastructure
+
+Oracle databases don't have to live on legacy infrastructure. This project runs **Oracle 26ai** — the latest Oracle Database release with built-in AI Vector Search and JSON Relational Duality — on a fully modern, cloud-native stack:
+
+- **Kubernetes** as the control plane for all infrastructure lifecycle management
+- **KubeVirt** to run Oracle as virtual machines inside Kubernetes, combining VM isolation with Kubernetes orchestration
+- **Red Hat Enterprise Linux 9** as the guest OS — the certified, hardened platform for Oracle Database with SELinux, cgroups v2, and long-term support
+- **Ansible** as the declarative automation engine — every phase from VM provisioning to Data Guard configuration is idempotent and repeatable
+- **Terraform** to provision the cloud observability layer as code — datastreams, datasets, OPAL transforms, and dashboards
+- **OpenTelemetry** as the vendor-neutral telemetry standard, shipping metrics and logs to any OTLP-compatible backend
+
+The result: Oracle RAC with Data Guard and FSFO, running on RHEL 9 VMs inside Kubernetes, fully provisioned by two Ansible commands, with production-grade observability wired in from the start. No manual steps. No ClickOps. Everything in Git.
+
+---
+
 ## The Problem with Oracle RAC in the Cloud-Native Era
 
 Oracle Real Application Clusters remains one of the most complex pieces of enterprise infrastructure to deploy. A production-grade RAC setup demands shared storage, private interconnect networking, Grid Infrastructure with ASM, multi-node cluster coordination, and — in high-availability configurations — Data Guard replication and Fast-Start Failover observers. That's before monitoring enters the picture.
