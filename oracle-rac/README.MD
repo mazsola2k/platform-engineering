@@ -32,7 +32,7 @@ flowchart TB
     OTEL --> Collector["<b>OTEL Collector — K8s</b><br/>prometheus receiver<br/>oracledb receiver<br/>filelog receiver"]
 
     Collector -- "scrape :9100" --> VMs
-    Collector -- "SQL :1521" --> VMs
+    Collector -- "SQL :1521<br/>SCAN :1521" --> VMs
     Collector -- "tail logs" --> VMs
 
     Collector -- "OTLP/HTTP" --> Observe["<b>Observe Platform</b><br/>Datastream → Datasets<br/>→ OPAL Extraction<br/>→ 3 Dashboards — IaC"]
@@ -80,7 +80,58 @@ This single invocation executes a nine-phase sequence:
 
 **Phase 1 — Preflight.** Validates that KubeVirt is operational with the `HostDisk` feature gate, the RHEL 9 qcow2 image exists, and the host has enough storage and memory for the requested topology.
 
-**Phase 2 — L2 Network.** Creates a VXLAN overlay (VNI 100, UDP 4789) with a Linux bridge (`br-vm`) on the `192.168.10.0/24` subnet. Installs Multus CNI and creates a `NetworkAttachmentDefinition` so KubeVirt VMs receive static L2 IPs — a hard requirement for Oracle Cluster Interconnect.
+**Phase 2 — L2 Network.** Creates a VXLAN overlay (VNI 100, UDP 4789) with a Linux bridge (`br-vm`) on the `192.168.10.0/24` subnet. Installs Multus CNI and creates a `NetworkAttachmentDefinition` so KubeVirt VMs receive static L2 IPs — a hard requirement for Oracle Cluster Interconnect and the SCAN listener.
+
+```mermaid
+flowchart TB
+    subgraph K8s["Kubernetes Host"]
+        direction TB
+        subgraph VXLAN["L2 VXLAN Overlay — 192.168.10.0/24"]
+            direction LR
+            Bridge["<b>br-vm</b><br/>Linux Bridge<br/>192.168.10.1"]
+            VX["<b>vxlan100</b><br/>VNI 100 · UDP 4789"]
+            Bridge --- VX
+        end
+
+        subgraph Multus["Multus CNI — NetworkAttachmentDefinition: rac-interconnect"]
+            direction LR
+            N1["<b>rac-node1</b><br/>192.168.10.11<br/>Grid + ASM + RAC DB<br/>Listener :1521"]
+            N2["<b>rac-node2</b><br/>192.168.10.12<br/>Grid + ASM + RAC DB<br/>Listener :1521"]
+            SCAN["<b>rac-scan</b> VIP<br/>192.168.10.100<br/>SCAN Listener :1521<br/>Load-balanced service access"]
+            SB["<b>rac-standby</b><br/>192.168.10.13<br/>Data Guard Standby<br/>Listener :1521"]
+            OB["<b>rac-observer</b><br/>192.168.10.14<br/>FSFO Observer<br/>Instant Client"]
+        end
+
+        VXLAN --- Multus
+
+        subgraph ASM["Shared ASM Disks — HostDisk"]
+            direction LR
+            D1["asm-data.img<br/>+DATA 20G"]
+            D2["asm-fra.img<br/>+FRA 10G"]
+            D3["asm-vote.img<br/>+VOTE 2G"]
+        end
+
+        N1 --- D1 & D2 & D3
+        N2 --- D1 & D2 & D3
+    end
+
+    style K8s fill:#1a1a2e,stroke:#16213e,color:#fff
+    style VXLAN fill:#0f3460,stroke:#1a508b,color:#fff
+    style Multus fill:#16213e,stroke:#1a508b,color:#fff
+    style ASM fill:#1a1a2e,stroke:#e94560,color:#fff
+    style Bridge fill:#3498db,stroke:#2471a3,color:#fff
+    style VX fill:#3498db,stroke:#2471a3,color:#fff
+    style N1 fill:#e67e22,stroke:#c0641a,color:#fff
+    style N2 fill:#e67e22,stroke:#c0641a,color:#fff
+    style SCAN fill:#e74c3c,stroke:#c0392b,color:#fff
+    style SB fill:#27ae60,stroke:#1e8449,color:#fff
+    style OB fill:#8e44ad,stroke:#6c3483,color:#fff
+    style D1 fill:#e94560,stroke:#c0392b,color:#fff
+    style D2 fill:#e94560,stroke:#c0392b,color:#fff
+    style D3 fill:#e94560,stroke:#c0392b,color:#fff
+```
+
+The SCAN (Single Client Access Name) listener at `192.168.10.100:1521` provides load-balanced, location-transparent database access across the RAC nodes. It is registered automatically by Grid Infrastructure during Phase 5 and resolves to whichever RAC node can service the connection. The OTEL `oracledb` receiver connects through both the per-node listeners (:1521) and the SCAN listener for service-level monitoring.
 
 **Phase 3 — Shared ASM Disks.** Creates raw disk images on the host filesystem: `asm-data.img` (20 GB), `asm-fra.img` (10 GB), `asm-vote.img` (2 GB). These are mounted as shared `HostDisk` volumes into each RAC node VM.
 
