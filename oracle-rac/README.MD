@@ -393,6 +393,8 @@ Three log streams are tailed in real time via the OTEL `filelog` receiver:
 
 ## Part 3: Observe — Dashboards as Code
 
+![alt text](image.png)
+
 The Terraform module in `observe-terraform/` doesn't just create a datastream and call it done. It builds a complete analytical layer using Observe's OPAL (Observe Processing and Analytics Language).
 
 ### The OPAL Extraction Pipeline
