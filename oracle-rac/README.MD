@@ -236,6 +236,8 @@ This triggers three coordinated stages:
 
 ```mermaid
 flowchart LR
+    ANS(["fa:fa-cogs <b>Ansible</b><br/>otel-controller.yaml"])
+
     subgraph SOURCES["Oracle RAC VMs"]
         direction TB
         NE["node_exporter<br/>+ cron collector.sh"]
@@ -266,8 +268,15 @@ flowchart LR
         DSET --> DASH["3 Dashboards<br/>Overview · SQL · Waits&IO<br/>30+ widgets"]
     end
 
-    TF["<b>Stage 1 — terraform apply</b><br/>observe-terraform/"] -- "creates datastream,<br/>datasets, dashboards" --> CLOUD
-    TF -. "returns ingest token<br/>+ endpoint URL" .-> COL
+    TF["<b>terraform apply</b><br/>observe-terraform/"]
+
+    ANS -- "Stage 1: runs" --> TF
+    ANS -- "Stage 2: deploys" --> COL
+    ANS -- "Stage 3: wires receivers<br/>+ installs node_exporter" --> WIRE
+    ANS -- "installs collector.sh<br/>+ cron" --> SOURCES
+
+    TF -- "creates datastream,<br/>datasets, dashboards" --> CLOUD
+    TF -. "returns ingest token<br/>+ endpoint URL" .-> ANS
 
     NE -- ":9100" --> PR
     DB -- ":1521" --> OR
@@ -279,6 +288,7 @@ flowchart LR
 
     COL -- "OTLP/HTTP<br/>bearer token" --> DS
 
+    style ANS fill:#3498db,stroke:#2471a3,color:#fff
     style SOURCES fill:#fef2f2,stroke:#e94560,color:#1a1a2e
     style WIRE fill:#fff8f0,stroke:#e67e22,color:#1a1a2e
     style DEPLOY fill:#f0faf4,stroke:#27ae60,color:#1a1a2e
