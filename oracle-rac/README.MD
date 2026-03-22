@@ -236,31 +236,6 @@ This triggers three coordinated stages:
 
 ```mermaid
 flowchart LR
-    subgraph DECLARE["Stage 1 — Terraform"]
-        direction TB
-        TF["<b>terraform apply</b><br/>observe-terraform/"]
-        TF --> DS["Datastream<br/>oracle-rac-otel"]
-        TF --> DSET["12 Datasets<br/>OPAL extraction"]
-        TF --> DASH["3 Dashboards<br/>30+ widgets"]
-        TF --> TOKEN["Ingest Token<br/>+ Endpoint URL"]
-    end
-
-    subgraph DEPLOY["Stage 2 — OTEL Collector"]
-        direction TB
-        COL["<b>Collector Pod</b><br/>K8s Deployment"]
-        CM["ConfigMap<br/>merged YAML"]
-        SVC["Service<br/>:4317 · :4318"]
-        CM --> COL
-        SVC --> COL
-    end
-
-    subgraph WIRE["Stage 3 — RAC Receivers"]
-        direction TB
-        PR["prometheus receiver<br/>node_exporter :9100<br/>+ textfile collector"]
-        OR["oracledb receiver<br/>SQL :1521 per node"]
-        FL["filelog receiver<br/>alert · listener · audit"]
-    end
-
     subgraph SOURCES["Oracle RAC VMs"]
         direction TB
         NE["node_exporter<br/>+ cron collector.sh"]
@@ -268,25 +243,50 @@ flowchart LR
         LOGS["Log files<br/>/u01/app/..."]
     end
 
-    TOKEN -- "bearer token<br/>injected by Ansible" --> COL
-    PR --> COL
-    OR --> COL
-    FL --> COL
-    COL -- "OTLP/HTTP" --> DS
+    subgraph WIRE["Stage 3 — RAC Receivers"]
+        direction TB
+        PR["prometheus receiver<br/>:9100 + textfile"]
+        OR["oracledb receiver<br/>SQL :1521 per node"]
+        FL["filelog receiver<br/>alert · listener · audit"]
+    end
+
+    subgraph DEPLOY["Stage 2 — OTEL Collector · K8s"]
+        direction TB
+        CM["ConfigMap<br/>merged YAML"]
+        COL["<b>Collector Pod</b><br/>K8s Deployment"]
+        SVC["Service<br/>:4317 · :4318"]
+        CM --> COL
+        SVC --> COL
+    end
+
+    subgraph CLOUD["Cloud Observability Platform — e.g. Observe Inc"]
+        direction TB
+        DS["<b>Datastream</b><br/>oracle-rac-otel<br/>OTLP/HTTP ingest"]
+        DS --> DSET["12 Datasets<br/>OPAL extraction · fan-out"]
+        DSET --> DASH["3 Dashboards<br/>Overview · SQL · Waits&IO<br/>30+ widgets"]
+    end
+
+    TF["<b>Stage 1 — terraform apply</b><br/>observe-terraform/"] -- "creates datastream,<br/>datasets, dashboards" --> CLOUD
+    TF -- "returns ingest token<br/>+ endpoint URL" -.-> COL
 
     NE -- ":9100" --> PR
     DB -- ":1521" --> OR
     LOGS -- "tail" --> FL
 
-    style DECLARE fill:#f0f4ff,stroke:#4a90d9,color:#1a1a2e
-    style DEPLOY fill:#f0faf4,stroke:#27ae60,color:#1a1a2e
-    style WIRE fill:#fff8f0,stroke:#e67e22,color:#1a1a2e
+    PR --> COL
+    OR --> COL
+    FL --> COL
+
+    COL -- "OTLP/HTTP<br/>bearer token" --> DS
+
     style SOURCES fill:#fef2f2,stroke:#e94560,color:#1a1a2e
+    style WIRE fill:#fff8f0,stroke:#e67e22,color:#1a1a2e
+    style DEPLOY fill:#f0faf4,stroke:#27ae60,color:#1a1a2e
+    style CLOUD fill:#f3e8ff,stroke:#8e44ad,color:#1a1a2e
     style TF fill:#4a90d9,stroke:#2c5f9e,color:#fff
     style DS fill:#8e44ad,stroke:#6c3483,color:#fff
-    style DSET fill:#8e44ad,stroke:#6c3483,color:#fff
+    style DSET fill:#9b59b6,stroke:#7d3c98,color:#fff
     style DASH fill:#8e44ad,stroke:#6c3483,color:#fff
-    style TOKEN fill:#3498db,stroke:#2471a3,color:#fff
     style COL fill:#27ae60,stroke:#1e8449,color:#fff
     style CM fill:#2ecc71,stroke:#27ae60,color:#fff
     style SVC fill:#2ecc71,stroke:#27ae60,color:#fff
