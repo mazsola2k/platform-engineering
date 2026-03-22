@@ -89,7 +89,7 @@ flowchart LR
     OTEL -- "prometheus :9100" --> N1 & N2 & SB
     OTEL -. "filelog" .-> N1 & N2 & SB
 
-    style NET fill:#0d1117,stroke:#1a508b,color:#c9d1d9
+    style NET fill:#f8f9fa,stroke:#1a508b,color:#1a1a2e
     style N1 fill:#e67e22,stroke:#c0641a,color:#fff
     style N2 fill:#e67e22,stroke:#c0641a,color:#fff
     style SCAN fill:#e74c3c,stroke:#c0392b,color:#fff
@@ -162,10 +162,10 @@ flowchart TB
         N2 --- D1 & D2 & D3
     end
 
-    style K8s fill:#1a1a2e,stroke:#16213e,color:#fff
-    style VXLAN fill:#0f3460,stroke:#1a508b,color:#fff
-    style Multus fill:#16213e,stroke:#1a508b,color:#fff
-    style ASM fill:#1a1a2e,stroke:#e94560,color:#fff
+    style K8s fill:#ffffff,stroke:#d0d7de,color:#1a1a2e
+    style VXLAN fill:#e8f0fe,stroke:#1a508b,color:#1a1a2e
+    style Multus fill:#f0f4f8,stroke:#1a508b,color:#1a1a2e
+    style ASM fill:#fef2f2,stroke:#e94560,color:#1a1a2e
     style Bridge fill:#3498db,stroke:#2471a3,color:#fff
     style VX fill:#3498db,stroke:#2471a3,color:#fff
     style N1 fill:#e67e22,stroke:#c0641a,color:#fff
