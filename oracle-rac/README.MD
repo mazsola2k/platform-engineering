@@ -232,7 +232,71 @@ ansible-playbook otel-controller.yaml \
   -e 'component=["observe-dashboards","collector","oracle-rac"]'
 ```
 
-This triggers three coordinated stages.
+This triggers three coordinated stages:
+
+```mermaid
+flowchart LR
+    subgraph DECLARE["Stage 1 — Terraform"]
+        direction TB
+        TF["<b>terraform apply</b><br/>observe-terraform/"]
+        TF --> DS["Datastream<br/>oracle-rac-otel"]
+        TF --> DSET["12 Datasets<br/>OPAL extraction"]
+        TF --> DASH["3 Dashboards<br/>30+ widgets"]
+        TF --> TOKEN["Ingest Token<br/>+ Endpoint URL"]
+    end
+
+    subgraph DEPLOY["Stage 2 — OTEL Collector"]
+        direction TB
+        COL["<b>Collector Pod</b><br/>K8s Deployment"]
+        CM["ConfigMap<br/>merged YAML"]
+        SVC["Service<br/>:4317 · :4318"]
+        CM --> COL
+        SVC --> COL
+    end
+
+    subgraph WIRE["Stage 3 — RAC Receivers"]
+        direction TB
+        PR["prometheus receiver<br/>node_exporter :9100<br/>+ textfile collector"]
+        OR["oracledb receiver<br/>SQL :1521 per node"]
+        FL["filelog receiver<br/>alert · listener · audit"]
+    end
+
+    subgraph SOURCES["Oracle RAC VMs"]
+        direction TB
+        NE["node_exporter<br/>+ cron collector.sh"]
+        DB["Oracle DB<br/>:1521"]
+        LOGS["Log files<br/>/u01/app/..."]
+    end
+
+    TOKEN -- "bearer token<br/>injected by Ansible" --> COL
+    PR --> COL
+    OR --> COL
+    FL --> COL
+    COL -- "OTLP/HTTP" --> DS
+
+    NE -- ":9100" --> PR
+    DB -- ":1521" --> OR
+    LOGS -- "tail" --> FL
+
+    style DECLARE fill:#f0f4ff,stroke:#4a90d9,color:#1a1a2e
+    style DEPLOY fill:#f0faf4,stroke:#27ae60,color:#1a1a2e
+    style WIRE fill:#fff8f0,stroke:#e67e22,color:#1a1a2e
+    style SOURCES fill:#fef2f2,stroke:#e94560,color:#1a1a2e
+    style TF fill:#4a90d9,stroke:#2c5f9e,color:#fff
+    style DS fill:#8e44ad,stroke:#6c3483,color:#fff
+    style DSET fill:#8e44ad,stroke:#6c3483,color:#fff
+    style DASH fill:#8e44ad,stroke:#6c3483,color:#fff
+    style TOKEN fill:#3498db,stroke:#2471a3,color:#fff
+    style COL fill:#27ae60,stroke:#1e8449,color:#fff
+    style CM fill:#2ecc71,stroke:#27ae60,color:#fff
+    style SVC fill:#2ecc71,stroke:#27ae60,color:#fff
+    style PR fill:#e67e22,stroke:#c0641a,color:#fff
+    style OR fill:#e67e22,stroke:#c0641a,color:#fff
+    style FL fill:#e67e22,stroke:#c0641a,color:#fff
+    style NE fill:#e94560,stroke:#c0392b,color:#fff
+    style DB fill:#e94560,stroke:#c0392b,color:#fff
+    style LOGS fill:#e94560,stroke:#c0392b,color:#fff
+```
 
 ### Stage 1: Terraform Creates the Observe Backend
 
