@@ -14,6 +14,11 @@
     vm_name: "{{ vmName | default('win11client') }}"
   tags: always
 
+- name: Set node_ip default (host LAN IP for Sunshine externalIPs)
+  ansible.builtin.set_fact:
+    node_ip: "{{ node_ip | default('192.168.2.148') }}"
+  tags: always
+
 # ============================================================
 # Pre-flight checks
 # ============================================================
@@ -559,6 +564,12 @@
                     <RequiresUserInput>false</RequiresUserInput>
                     <CommandLine>powershell -Command "$cert = New-SelfSignedCertificate -DnsName 'localhost',$env:COMPUTERNAME -CertStoreLocation 'cert:\LocalMachine\My' -NotAfter (Get-Date).AddYears(10); try { Remove-WSManInstance winrm/config/Listener -SelectorSet @{Address='*';Transport='HTTPS'} } catch {}; New-WSManInstance winrm/config/Listener -SelectorSet @{Address='*';Transport='HTTPS'} -ValueSet @{Hostname=$env:COMPUTERNAME;CertificateThumbprint=$cert.Thumbprint}; New-NetFirewallRule -DisplayName 'Allow WinRM HTTPS' -Direction Inbound -Protocol TCP -LocalPort 5986 -Action Allow -Profile Any; Restart-Service WinRM"</CommandLine>
                   </SynchronousCommand>
+                  <SynchronousCommand wcm:action="add">
+                    <Order>6</Order>
+                    <Description>Allow Sunshine/Moonlight streaming ports through firewall</Description>
+                    <RequiresUserInput>false</RequiresUserInput>
+                    <CommandLine>powershell -Command "New-NetFirewallRule -DisplayName 'Sunshine TCP' -Direction Inbound -Protocol TCP -LocalPort 47984-48010 -Action Allow -Profile Any; New-NetFirewallRule -DisplayName 'Sunshine UDP' -Direction Inbound -Protocol UDP -LocalPort 47984-48010 -Action Allow -Profile Any"</CommandLine>
+                  </SynchronousCommand>
                 </FirstLogonCommands>
               </component>
             </settings>
@@ -846,9 +857,9 @@
                     model: "host-passthrough"
                   resources:
                     requests:
-                      memory: "{{ vm_memory | default('8Gi') }}"
+                      memory: "{{ vm_memory | default('16Gi') }}"
                   memory:
-                    guest: "{{ vm_memory | default('8Gi') }}"
+                    guest: "{{ vm_memory | default('16Gi') }}"
                   machine:
                     type: q35
                   firmware:
@@ -917,6 +928,44 @@
                       - name: default
                         masquerade: {}
                         model: virtio
+                        ports:
+                          - name: rdp
+                            port: 3389
+                            protocol: TCP
+                          - name: vnc
+                            port: 5900
+                            protocol: TCP
+                          - name: winrm
+                            port: 5985
+                            protocol: TCP
+                          - name: winrm-https
+                            port: 5986
+                            protocol: TCP
+                          # Sunshine/Moonlight streaming ports
+                          - name: sunshine-https
+                            port: 47984
+                            protocol: TCP
+                          - name: sunshine-http
+                            port: 47989
+                            protocol: TCP
+                          - name: sunshine-web
+                            port: 47990
+                            protocol: TCP
+                          - name: sun-rtsp
+                            port: 48010
+                            protocol: TCP
+                          - name: sun-video-u
+                            port: 47998
+                            protocol: UDP
+                          - name: sun-control-u
+                            port: 47999
+                            protocol: UDP
+                          - name: sun-audio-u
+                            port: 48000
+                            protocol: UDP
+                      - name: lan
+                        bridge: {}
+                        model: virtio
                     inputs:
                       - type: tablet
                         bus: usb
@@ -924,6 +973,9 @@
                 networks:
                   - name: default
                     pod: {}
+                  - name: lan
+                    multus:
+                      networkName: win-lan
                 volumes:
                   - name: installer-iso
                     persistentVolumeClaim:
@@ -1067,6 +1119,53 @@
                 port: 3389
                 targetPort: 3389
                 protocol: TCP
+
+    - name: Create Sunshine streaming service (externalIPs on standard ports)
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: "{{ vm_name }}-sunshine"
+            namespace: "{{ kubevirt_namespace }}"
+            labels:
+              app: "{{ vm_name }}"
+          spec:
+            type: ClusterIP
+            externalIPs:
+              - "{{ node_ip }}"
+            selector:
+              kubevirt.io/vm: "{{ vm_name }}"
+            ports:
+              - name: sunshine-https
+                port: 47984
+                targetPort: 47984
+                protocol: TCP
+              - name: sunshine-http
+                port: 47989
+                targetPort: 47989
+                protocol: TCP
+              - name: sunshine-web
+                port: 47990
+                targetPort: 47990
+                protocol: TCP
+              - name: sun-rtsp
+                port: 48010
+                targetPort: 48010
+                protocol: TCP
+              - name: sun-video-udp
+                port: 47998
+                targetPort: 47998
+                protocol: UDP
+              - name: sun-control-udp
+                port: 47999
+                targetPort: 47999
+                protocol: UDP
+              - name: sun-audio-udp
+                port: 48000
+                targetPort: 48000
+                protocol: UDP
 
     - name: Create WinRM HTTP access service (ClusterIP)
       kubernetes.core.k8s:

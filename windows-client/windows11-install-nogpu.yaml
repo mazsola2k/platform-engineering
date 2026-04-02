@@ -885,6 +885,9 @@
                       - name: default
                         masquerade: {}
                         model: virtio
+                      - name: lan
+                        bridge: {}
+                        model: virtio
                     inputs:
                       - type: tablet
                         bus: usb
@@ -892,6 +895,9 @@
                 networks:
                   - name: default
                     pod: {}
+                  - name: lan
+                    multus:
+                      networkName: win-lan
                 volumes:
                   - name: installer-iso
                     persistentVolumeClaim:

@@ -1,0 +1,133 @@
+---
+# Create br-vm bridge + Multus NetworkAttachmentDefinition for Windows VM LAN connectivity.
+# Reuses the same br-vm bridge as Oracle RAC — no NAT, no masquerade, no conntrack issues.
+# VM gets a real IP directly on the LAN via DHCP (or static) on its second NIC (eth1).
+
+# ---- Ensure Multus CNI is present ----
+- name: Check if Multus CRD exists
+  ansible.builtin.shell:
+    cmd: kubectl get crd network-attachment-definitions.k8s.cni.cncf.io 2>/dev/null && echo "FOUND" || echo "NOT_FOUND"
+  register: multus_crd_check
+  changed_when: false
+
+- name: Install Multus CNI (thin plugin)
+  ansible.builtin.shell:
+    cmd: kubectl apply -f https://raw.githubusercontent.com/k8snetworkplumbingwg/multus-cni/master/deployments/multus-daemonset.yml
+  when: "'NOT_FOUND' in multus_crd_check.stdout"
+
+- name: Wait for Multus CRD to be established
+  kubernetes.core.k8s_info:
+    api_version: apiextensions.k8s.io/v1
+    kind: CustomResourceDefinition
+    name: network-attachment-definitions.k8s.cni.cncf.io
+  register: multus_crd_wait
+  until: multus_crd_wait.resources | length > 0
+  retries: 30
+  delay: 5
+  when: "'NOT_FOUND' in multus_crd_check.stdout"
+
+- name: Wait for Multus pods to be ready
+  ansible.builtin.shell:
+    cmd: kubectl -n kube-system wait --for=condition=ready pod -l app=multus --timeout=120s 2>&1 || true
+  when: "'NOT_FOUND' in multus_crd_check.stdout"
+
+- name: Fix Multus kubeconfig to use real API server endpoint
+  ansible.builtin.shell: |
+    KUBECONFIG_FILE=/etc/cni/net.d/multus.d/multus.kubeconfig
+    if [ -f "$KUBECONFIG_FILE" ]; then
+      API_SERVER=$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}')
+      if grep -q "10.96.0.1" "$KUBECONFIG_FILE" 2>/dev/null; then
+        sed -i "s|server: https://10.96.0.1:443|server: $API_SERVER|" "$KUBECONFIG_FILE"
+        echo "Fixed Multus kubeconfig: cluster-IP -> $API_SERVER"
+      else
+        echo "Multus kubeconfig already uses real API endpoint"
+      fi
+    else
+      echo "Multus kubeconfig not found yet — will be created by daemonset"
+    fi
+  become: true
+
+- name: Ensure Multus CNI binary is in kubelet CNI path
+  ansible.builtin.shell: |
+    KUBELET_CNI=$(ps aux | grep kubelet | grep -oP '(?<=--cni-bin-dir=)\S+' || echo "/usr/libexec/cni")
+    [ -z "$KUBELET_CNI" ] && KUBELET_CNI="/usr/libexec/cni"
+    if [ -f /opt/cni/bin/multus ] && [ ! -f "$KUBELET_CNI/multus" ]; then
+      ln -sf /opt/cni/bin/multus "$KUBELET_CNI/multus"
+      echo "symlinked multus to $KUBELET_CNI/"
+    fi
+    if [ -f /opt/cni/bin/multus-shim ] && [ ! -f "$KUBELET_CNI/multus-shim" ]; then
+      ln -sf /opt/cni/bin/multus-shim "$KUBELET_CNI/multus-shim"
+      echo "symlinked multus-shim to $KUBELET_CNI/"
+    fi
+    echo "multus binaries verified"
+  become: true
+
+# ---- Create br-vm bridge on the host ----
+# Shared with Oracle RAC — if RAC is also deployed, this bridge already exists.
+- name: Get K8s node primary IP
+  ansible.builtin.shell:
+    cmd: kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}'
+  register: k8s_node_ip
+  changed_when: false
+
+- name: Create br-vm bridge (shared with Oracle RAC)
+  ansible.builtin.shell: |
+    set -e
+    if ! ip link show br-vm &>/dev/null; then
+      ip link add br-vm type bridge
+      ip link set br-vm up
+      echo "created br-vm bridge"
+    else
+      echo "br-vm already exists"
+    fi
+
+    # Disable UDP/TCP segmentation offloads on the bridge.
+    # Without this, Sunshine video (UDP 47998) arrives with truncated-udplength 0
+    # because the kernel passes unsegmented GSO frames through the bridge.
+    ethtool -K br-vm gso off gro off tso off tx-udp-segmentation off 2>/dev/null || true
+    echo "br-vm offloads disabled (gso/gro/tso/tx-udp-segmentation off)"
+
+    # Assign host-side IP so the host can reach VMs on this bridge
+    if ! ip addr show br-vm | grep -q '{{ win_bridge_host_ip }}/'; then
+      ip addr add {{ win_bridge_host_ip }}/{{ win_bridge_prefix }} dev br-vm
+      echo "assigned {{ win_bridge_host_ip }}/{{ win_bridge_prefix }} to br-vm"
+    else
+      echo "br-vm already has {{ win_bridge_host_ip }} assigned"
+    fi
+  become: true
+
+# ---- Create Multus NetworkAttachmentDefinition ----
+- name: Create Multus NetworkAttachmentDefinition for Windows LAN
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: k8s.cni.cncf.io/v1
+      kind: NetworkAttachmentDefinition
+      metadata:
+        name: win-lan
+        namespace: "{{ kubevirt_namespace }}"
+      spec:
+        config: |
+          {
+            "cniVersion": "0.3.1",
+            "name": "win-lan",
+            "type": "bridge",
+            "bridge": "br-vm",
+            "isGateway": false,
+            "ipam": {}
+          }
+
+- name: Display network configuration
+  ansible.builtin.debug:
+    msg:
+      - "✅ Windows VM LAN bridge ready"
+      - "  Bridge:       br-vm"
+      - "  Host IP:      {{ win_bridge_host_ip }}/{{ win_bridge_prefix }}"
+      - "  NAD:          win-lan (namespace: {{ kubevirt_namespace }})"
+      - "  Node IP:      {{ k8s_node_ip.stdout }}"
+      - ""
+      - "Next: reinstall the VM so it picks up the new NIC:"
+      - "  ansible-playbook windows-client-controller.yaml -e action=reinstall"
+      - ""
+      - "The VM will get a second NIC (eth1) bridged directly to br-vm."
+      - "Assign a static IP in Windows or let your DHCP server allocate one."

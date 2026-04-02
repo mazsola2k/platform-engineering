@@ -12,8 +12,12 @@
 #   ansible-playbook windows-client-controller.yaml -e action=gpu-setup -e gpu_confirm=yes
 #   ansible-playbook windows-client-controller.yaml -e action=gpu-claim
 #   ansible-playbook windows-client-controller.yaml -e action=gpu-release
+#   ansible-playbook windows-client-controller.yaml -e action=network-install
+#   ansible-playbook windows-client-controller.yaml -e action=network-uninstall
 #
 # Key variables (override with -e):
+#   win_bridge_host_ip   Host-side IP on br-vm bridge (default: 192.168.100.1)
+#   win_bridge_prefix    Prefix length for br-vm host IP (default: 24)
 #   vm_name              VM name in Kubernetes (default: win11client)
 #   kubevirt_namespace   Namespace to deploy into (default: default)
 #   windows_admin_password  Local Administrator password (default: SecureP@ssw0rd!)
@@ -56,6 +60,8 @@
         system_disk_size: "{{ system_disk_size | default('64Gi') }}"
         storage_dir: "{{ storage_dir | default('/var/lib/kubevirt') }}"
         windows_admin_password: "{{ windows_admin_password | default('SecureP@ssw0rd!') }}"
+        win_bridge_host_ip: "{{ win_bridge_host_ip | default('192.168.100.1') }}"
+        win_bridge_prefix: "{{ win_bridge_prefix | default('24') }}"
 
     - name: Set kubevirt_namespace default if not provided
       ansible.builtin.set_fact:
@@ -64,7 +70,7 @@
     - name: Validate action parameter
       ansible.builtin.fail:
         msg: "Invalid action '{{ action }}'. Must be one of: install, uninstall, reinstall, reinstall-nogpu, install-nogpu, status"
-      when: action not in ['install', 'uninstall', 'reinstall', 'reinstall-nogpu', 'install-nogpu', 'status', 'gpu-setup', 'gpu-claim', 'gpu-release', 'nvidia-driver']
+      when: action not in ['install', 'uninstall', 'reinstall', 'reinstall-nogpu', 'install-nogpu', 'status', 'gpu-setup', 'gpu-claim', 'gpu-release', 'nvidia-driver', 'network-install', 'network-uninstall']
 
     - name: Display controller banner
       ansible.builtin.debug:
@@ -117,6 +123,16 @@
       vars:
         gpu_action: release
       when: action == 'gpu-release'
+
+    # Network: create br-vm bridge + win-lan Multus NAD
+    - name: Execute Windows network setup
+      ansible.builtin.include_tasks: windows-client/windows-network-install.yaml
+      when: action == 'network-install'
+
+    # Network: remove win-lan NAD (br-vm kept if shared with RAC)
+    - name: Execute Windows network teardown
+      ansible.builtin.include_tasks: windows-client/windows-network-uninstall.yaml
+      when: action == 'network-uninstall'
 
     # Post-install automation tasks (runs over WinRM HTTPS)
     - name: Execute Windows 11 post-install automation

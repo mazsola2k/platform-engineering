@@ -18,9 +18,10 @@ End-to-end guide for running a Windows 11 VM under Kubernetes/KubeVirt with a de
 10. [Phase 6 — NVIDIA Driver Installation (WinRM)](#phase-6--nvidia-driver-installation-winrm)
 11. [Phase 7 — Release GPU Back to Linux](#phase-7--release-gpu-back-to-linux)
 12. [Updating the NVIDIA Driver](#updating-the-nvidia-driver)
-13. [Under the Hood — KubeVirt IS QEMU](#under-the-hood--kubevirt-is-qemu)
-14. [Troubleshooting](#troubleshooting)
-15. [File Reference](#file-reference)
+13. [Video Streaming — Sunshine/Moonlight over Bridge Network](#video-streaming--sunshinemoonlight-over-bridge-network)
+14. [Under the Hood — KubeVirt IS QEMU](#under-the-hood--kubevirt-is-qemu)
+15. [Troubleshooting](#troubleshooting)
+16. [File Reference](#file-reference)
 
 ---
 
@@ -565,6 +566,101 @@ flowchart TD
     GR --> LCUDA(["GPU back to Linux\nnvidia-smi / ollama / CUDA"])
     LCUDA -->|"Reclaim for Windows later"| GC
 ```
+
+---
+
+## Video Streaming — Sunshine/Moonlight over Bridge Network
+
+Once the GPU is passed through and the NVIDIA driver is installed, you can use **Sunshine** (server inside the Windows VM) and **Moonlight** (client on any device) for low-latency game/desktop streaming over the local network.
+
+### How It Works
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│  Kubernetes Host (Fedora Linux)                                   │
+│                                                                   │
+│  ┌────────────────────┐         ┌───────────────────────────┐   │
+│  │  Moonlight Client   │◄──UDP──►│  br-vm bridge             │   │
+│  │  (Flatpak/native)   │  47998  │  192.168.100.1/24         │   │
+│  │                     │  47999  │  offloads: GSO/GRO/TSO off│   │
+│  │                     │  48000  │                           │   │
+│  └────────────────────┘         └─────────┬─────────────────┘   │
+│                                            │ veth + tap          │
+│                                 ┌──────────▼────────────────┐   │
+│                                 │  KubeVirt Windows 11 VM    │   │
+│                                 │  192.168.100.10            │   │
+│                                 │  Sunshine Server            │   │
+│                                 │  RTX 3090 GPU (vfio-pci)   │   │
+│                                 └───────────────────────────┘   │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+### Sunshine Ports
+
+| Port  | Protocol | Purpose        |
+|-------|----------|----------------|
+| 47984 | TCP      | HTTPS control  |
+| 47989 | TCP      | HTTP API       |
+| 47990 | TCP      | Web UI         |
+| 48010 | TCP      | RTSP           |
+| 47998 | UDP      | **Video**      |
+| 47999 | UDP      | Audio          |
+| 48000 | UDP      | Control        |
+
+### What the Playbook Sets Up Automatically
+
+The `windows-client-controller.yaml -e action=install` playbook:
+
+1. **Windows firewall rules** — Opens TCP 47984–48010 and UDP 47984–48010 inbound (`Sunshine TCP` / `Sunshine UDP` rules).
+2. **Kubernetes Service** — Creates `win11client-sunshine` ClusterIP service with `externalIPs` mapping all Sunshine ports to the host node IP.
+3. **Bridge network (`br-vm`)** — Creates a host bridge at `192.168.100.1/24` with a Multus `NetworkAttachmentDefinition` (`win-lan`), giving the VM a second NIC directly on the bridge.
+4. **Network offload fix** — Disables GSO/GRO/TSO/tx-udp-segmentation on `br-vm` (see below).
+
+### Critical: Bridge Network Offload Fix
+
+**Problem:** Without disabling segmentation offloads on `br-vm`, Sunshine video streaming fails. The Moonlight client reports:
+
+> *"No video received from the host. Check your firewall and port forwarding rules — UDP 47998 and UDP 48000."*
+
+**Root cause:** The Linux kernel's Generic Segmentation Offload (GSO) passes large UDP video frames through the bridge without proper segmentation. These appear on the wire as `truncated-udplength 0` packets — the UDP header says length 0 but the IP packet contains data. Moonlight silently drops them.
+
+Audio (port 47999) and control (port 48000) work fine because they use small packets that don't trigger GSO aggregation. Only video (port 47998) is affected because encoded video frames are large enough for the kernel to apply GSO.
+
+**Fix (applied automatically by the playbook):**
+
+```bash
+ethtool -K br-vm gso off gro off tso off tx-udp-segmentation off
+```
+
+This is run in `windows-network-install.yaml` every time the bridge is created or already exists — it's idempotent. The offload settings are per-interface kernel state, so they reset whenever the bridge is recreated (reboot, `ip link delete`). The playbook applies them each run.
+
+### Manual Verification
+
+If streaming stops working after a host reboot (before re-running the playbook), verify and fix offloads manually:
+
+```bash
+# Check current offload state
+ethtool -k br-vm | grep -E 'generic-segmentation|generic-receive|tx-udp-seg'
+
+# If any show "on", disable them
+sudo ethtool -K br-vm gso off gro off tso off tx-udp-segmentation off
+```
+
+To verify video packets are not truncated during a Moonlight session:
+
+```bash
+# Should show "UDP, length NNN" — NOT "truncated-udplength 0"
+sudo tcpdump -i br-vm -n 'udp port 47998' -c 10
+```
+
+### Connecting with Moonlight
+
+1. **Install Sunshine** on the Windows VM — download from [GitHub releases](https://github.com/LizardByte/Sunshine/releases) and install.
+2. **Configure Sunshine** — open `https://192.168.100.10:47990` from the host browser, set a username/password.
+3. **Install Moonlight** on the client — Flatpak (`com.moonlight_stream.Moonlight`), native package, or on another device.
+4. **Add host** in Moonlight — use `192.168.100.10` (bridge IP) or the Kubernetes node IP if using the externalIPs service.
+5. **Pair** — enter the PIN shown in Moonlight into the Sunshine web UI.
+6. **Stream** — select a desktop or application.
 
 ---
 

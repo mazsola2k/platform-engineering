@@ -122,6 +122,12 @@
       echo "created br-vm bridge"
     fi
 
+    # Disable UDP/TCP segmentation offloads on the bridge.
+    # Without this, Sunshine video (UDP 47998) arrives with truncated-udplength 0
+    # because the kernel passes unsegmented GSO frames through the bridge.
+    ethtool -K br-vm gso off gro off tso off tx-udp-segmentation off 2>/dev/null || true
+    echo "br-vm offloads disabled (gso/gro/tso/tx-udp-segmentation off)"
+
     # Assign management IP to bridge (for host-to-VM connectivity)
     if ! ip addr show br-vm | grep -q '{{ rac_bridge_ip }}/'; then
       ip addr add {{ rac_bridge_ip }}/24 dev br-vm

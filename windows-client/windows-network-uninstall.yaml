@@ -1,0 +1,39 @@
+---
+# Remove the Windows VM Multus NAD.
+# Does NOT remove br-vm bridge — it may be shared with Oracle RAC.
+
+- name: Remove Multus NetworkAttachmentDefinition for Windows LAN
+  kubernetes.core.k8s:
+    state: absent
+    definition:
+      apiVersion: k8s.cni.cncf.io/v1
+      kind: NetworkAttachmentDefinition
+      metadata:
+        name: win-lan
+        namespace: "{{ kubevirt_namespace }}"
+
+- name: Check if Oracle RAC also uses br-vm
+  ansible.builtin.shell:
+    cmd: kubectl get network-attachment-definitions -A 2>/dev/null | grep -q "rac-interconnect" && echo "IN_USE" || echo "FREE"
+  register: brvm_usage
+  changed_when: false
+
+- name: Remove br-vm bridge (only if not used by Oracle RAC)
+  ansible.builtin.shell: |
+    ip link set br-vm down 2>/dev/null || true
+    ip link delete br-vm type bridge 2>/dev/null || true
+    echo "br-vm removed"
+  become: true
+  when: "'FREE' in brvm_usage.stdout"
+
+- name: Skip br-vm removal (still used by Oracle RAC)
+  ansible.builtin.debug:
+    msg: "br-vm kept — still referenced by rac-interconnect NAD"
+  when: "'IN_USE' in brvm_usage.stdout"
+
+- name: Display status
+  ansible.builtin.debug:
+    msg:
+      - "✅ Windows VM network uninstalled"
+      - "  NAD win-lan: removed"
+      - "  br-vm bridge: {{ 'removed' if 'FREE' in brvm_usage.stdout else 'kept (shared with RAC)' }}"

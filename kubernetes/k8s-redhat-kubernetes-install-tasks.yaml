@@ -229,7 +229,7 @@
   when: kubeadm_reset_required | default(false)
 
 - name: Initialize Kubernetes cluster (single-node)
-  ansible.builtin.command: kubeadm init --pod-network-cidr=192.168.0.0/16
+  ansible.builtin.command: kubeadm init --pod-network-cidr=10.244.0.0/16
   register: kubeadm_init
   args:
     creates: /etc/kubernetes/admin.conf
@@ -303,6 +303,70 @@
   register: calico_nat_out
   changed_when: "'configured' in calico_nat_out.stdout or calico_nat_out.rc == 0"
   failed_when: false
+
+# ── Calico IP Pool migration: 192.168.0.0/16 → 10.244.0.0/16 ──────────────
+# Existing clusters may still have the old 192.168.0.0/16 pool which conflicts
+# with the LAN 192.168.2.0/24 subnet. This block creates the new pool,
+# disables the old one, and restarts pods so they pick up new IPs.
+- name: Check current Calico IP pool CIDR
+  ansible.builtin.shell: |
+    kubectl get ippools default-ipv4-ippool -o jsonpath='{.spec.cidr}' 2>/dev/null || echo 'NOT_FOUND'
+  register: current_ippool_cidr
+  changed_when: false
+  failed_when: false
+
+- name: Migrate Calico IP pool from 192.168.0.0/16 to 10.244.0.0/16
+  when: current_ippool_cidr.stdout == '192.168.0.0/16'
+  block:
+    - name: Detect Calico IPPool API version
+      ansible.builtin.shell: |
+        kubectl get ippool default-ipv4-ippool -o jsonpath='{.apiVersion}' 2>/dev/null || echo 'crd.projectcalico.org/v1'
+      register: calico_api_version
+      changed_when: false
+
+    - name: Create new Calico IP pool (10.244.0.0/16)
+      ansible.builtin.shell: |
+        cat <<EOF | kubectl apply -f -
+        apiVersion: {{ calico_api_version.stdout }}
+        kind: IPPool
+        metadata:
+          name: new-pod-pool
+        spec:
+          cidr: 10.244.0.0/16
+          ipipMode: Never
+          natOutgoing: true
+          nodeSelector: all()
+        EOF
+      register: new_pool_created
+
+    - name: Delete old Calico IP pool (192.168.0.0/16)
+      ansible.builtin.shell: |
+        kubectl delete ippool default-ipv4-ippool --wait=true
+      register: old_pool_deleted
+
+    - name: Restart CoreDNS to pick up new IP range
+      ansible.builtin.command: kubectl -n kube-system rollout restart deployment/coredns
+
+    - name: Wait for CoreDNS to be ready after IP pool migration
+      ansible.builtin.shell: |
+        kubectl -n kube-system rollout status deployment/coredns --timeout=120s
+      changed_when: false
+
+    - name: Restart calico-node to update routing tables
+      ansible.builtin.shell: |
+        kubectl -n kube-system rollout restart daemonset/calico-node
+        kubectl -n kube-system rollout status daemonset/calico-node --timeout=120s
+      changed_when: false
+
+    - name: Display IP pool migration result
+      ansible.builtin.debug:
+        msg:
+          - "✅ Calico IP pool migrated from 192.168.0.0/16 → 10.244.0.0/16"
+          - "   Old pool (default-ipv4-ippool) has been deleted."
+          - "   New pool (new-pod-pool) is active with CIDR 10.244.0.0/16."
+          - "   ⚠️  Running VMs must be restarted to get new IPs from the new pool."
+          - "   Your LAN 192.168.2.0/24 is now reachable from VMs."
+# ── End Calico IP Pool migration ───────────────────────────────────────────
 
 - name: Configure CoreDNS for external DNS resolution
   ansible.builtin.shell: |
