@@ -14,6 +14,7 @@
 #   ansible-playbook windows-client-controller.yaml -e action=gpu-release
 #   ansible-playbook windows-client-controller.yaml -e action=network-install
 #   ansible-playbook windows-client-controller.yaml -e action=network-uninstall
+#   ansible-playbook windows-client-controller.yaml -e action=sunshine-install
 #
 # Key variables (override with -e):
 #   win_bridge_host_ip   Host-side IP on br-vm bridge (default: 192.168.100.1)
@@ -38,6 +39,9 @@
 #   nvidia_driver_version  NVIDIA driver version to install (default: 591.86)
 #   nvidia_driver_url      Direct download URL for the NVIDIA driver .exe
 #   nvidia_reinstall       Set to 'true' to force re-download and reinstall even if already installed (default: false)
+#   sunshine_version       Sunshine release tag (default: v2025.924.154138)
+#   sunshine_installer_url Direct download URL for Sunshine Windows installer
+#   sunshine_reinstall     Set to 'true' to force reinstall even if already installed (default: false)
 #   windows 11 urls      https://www.windowscentral.com/microsoft/windows-11/microsofts-official-windows-11-version-25h2-rtm-iso-media-is-now-available-download-all-28-languages-here-for-x64-or-arm64
 
 - name: Windows Client Controller
@@ -70,7 +74,7 @@
     - name: Validate action parameter
       ansible.builtin.fail:
         msg: "Invalid action '{{ action }}'. Must be one of: install, uninstall, reinstall, reinstall-nogpu, install-nogpu, status"
-      when: action not in ['install', 'uninstall', 'reinstall', 'reinstall-nogpu', 'install-nogpu', 'status', 'gpu-setup', 'gpu-claim', 'gpu-release', 'nvidia-driver', 'network-install', 'network-uninstall']
+      when: action not in ['install', 'uninstall', 'reinstall', 'reinstall-nogpu', 'install-nogpu', 'status', 'gpu-setup', 'gpu-claim', 'gpu-release', 'nvidia-driver', 'sunshine-install', 'network-install', 'network-uninstall']
 
     - name: Display controller banner
       ansible.builtin.debug:
@@ -134,12 +138,17 @@
       ansible.builtin.include_tasks: windows-client/windows-network-uninstall.yaml
       when: action == 'network-uninstall'
 
-    # Post-install automation tasks (runs over WinRM HTTPS)
+    # Post-install automation tasks (runs over WinRM HTTP)
     - name: Execute Windows 11 post-install automation
       ansible.builtin.include_tasks: windows-client/windows11-automation.yaml
       vars:
         automation_task: "{{ action }}"
       when: action in ['nvidia-driver']
+
+    # Sunshine streaming server install (runs over WinRM HTTP)
+    - name: Execute Sunshine streaming server install
+      ansible.builtin.include_tasks: windows-client/windows11-sunshine-install.yaml
+      when: action == 'sunshine-install'
 
     # Reinstall (uninstall then install)
     - name: Execute Windows 11 reinstallation
@@ -179,6 +188,7 @@
           - "  GPU Claim: ansible-playbook windows-client-controller.yaml -e action=gpu-claim"
           - "  GPU Rel:   ansible-playbook windows-client-controller.yaml -e action=gpu-release"
           - "  NVIDIA Drv: ansible-playbook windows-client-controller.yaml -e action=nvidia-driver"
+          - "  Sunshine:   ansible-playbook windows-client-controller.yaml -e action=sunshine-install"
           - ""
           - "Custom options:"
           - "  -e vm_name=mywin11          Custom VM name"

@@ -1,0 +1,327 @@
+# Sunshine Streaming Server — Download & Install on Windows VM
+# =============================================================
+# Downloads and silently installs the Sunshine game streaming server
+# (LizardByte) on the Windows 11 KubeVirt VM via WinRM.
+#
+# Called by windows-client-controller.yaml — do not run directly.
+#
+# Requires:
+#   - Windows VM running with WinRM enabled
+#   - GPU passed through and NVIDIA driver installed (Sunshine needs a GPU)
+#
+# Key variables (all optional, inherit from controller):
+#   vm_name                 VM name (default: win11client)
+#   kubevirt_namespace      Namespace (default: default)
+#   windows_admin_password  Administrator password (default: SecureP@ssw0rd!)
+#   sunshine_version        Sunshine release tag (default: v2025.924.154138)
+#   sunshine_installer_url  Direct download URL for the Sunshine .exe installer
+#   sunshine_reinstall      Set to 'true' to force reinstall (default: false)
+
+- name: Set Sunshine defaults
+  ansible.builtin.set_fact:
+    kubevirt_namespace: "{{ kubevirt_namespace | default('default') }}"
+    vm_name: "{{ vm_name | default('win11client') }}"
+    windows_admin_password: "{{ windows_admin_password | default('SecureP@ssw0rd!') }}"
+    sunshine_version: "{{ sunshine_version | default('v2025.924.154138') }}"
+    sunshine_installer_url: >-
+      {{ sunshine_installer_url | default(
+        'https://github.com/LizardByte/packages/raw/dist/Sunshine/'
+        + (sunshine_version | default('v2025.924.154138'))
+        + '/Sunshine-Windows-AMD64-installer.exe'
+      ) }}
+    sunshine_reinstall: "{{ sunshine_reinstall | default('false') }}"
+  tags: always
+
+# -----------------------------------------------------------------------
+# WinRM connectivity — HTTP (port 5985, basic/unencrypted)
+# -----------------------------------------------------------------------
+- name: Kill any stale WinRM port-forwards
+  ansible.builtin.shell: |
+    pkill -f "kubectl.*port-forward.*win11client-winrm" 2>/dev/null || true
+    sleep 1
+  ignore_errors: true
+
+- name: Start WinRM HTTP port-forward via library script (setsid — survives task exit)
+  ansible.builtin.shell: |
+    bash "{{ playbook_dir }}/library/start_portforward.sh" \
+      "{{ vm_name }}-winrm" \
+      5985 \
+      "{{ kubevirt_namespace }}" \
+      /tmp/winrm-pf.log \
+      /tmp/winrm-pf.pid
+    sleep 4
+  ignore_errors: true
+
+- name: Wait for WinRM HTTP to actually respond (not just TCP)
+  ansible.builtin.shell: |
+    for i in $(seq 1 30); do
+      code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 3 http://localhost:5985/wsman 2>/dev/null)
+      [ "$code" != "000" ] && exit 0
+      sleep 2
+    done
+    echo "WinRM did not respond after 60s" >&2
+    exit 1
+
+- name: Set WinRM HTTP connection vars
+  ansible.builtin.set_fact:
+    _winrm: &winrm_vars
+      ansible_connection: winrm
+      ansible_user: Administrator
+      ansible_password: "{{ windows_admin_password }}"
+      ansible_host: localhost
+      ansible_winrm_transport: basic
+      ansible_winrm_server_cert_validation: ignore
+      ansible_winrm_port: 5985
+      ansible_winrm_scheme: http
+  no_log: true
+
+- name: Confirm WinRM connectivity — get hostname
+  ansible.windows.win_command:
+    cmd: hostname
+  register: win_hostname
+  become: false
+  vars: *winrm_vars
+
+- name: Display connected VM hostname
+  ansible.builtin.debug:
+    msg: "✅ Connected to Windows VM: {{ win_hostname.stdout | trim }}"
+
+# -----------------------------------------------------------------------
+# Sunshine — download and silent install
+# -----------------------------------------------------------------------
+
+- name: "[sunshine] Ensure C:\\Data\\temp directory exists"
+  ansible.windows.win_file:
+    path: C:\Data\temp
+    state: directory
+  become: false
+  vars: *winrm_vars
+
+- name: "[sunshine] Write installer info — version {{ sunshine_version }}"
+  ansible.windows.win_shell: |
+    [System.IO.File]::WriteAllText(
+      "C:\Data\sunshine_installer_info.txt",
+      "VERSION={{ sunshine_version }}`nDOWNLOAD_URL={{ sunshine_installer_url }}`n"
+    )
+    Write-Host "Sunshine version  : {{ sunshine_version }}"
+    Write-Host "Download URL      : {{ sunshine_installer_url }}"
+  become: false
+  vars: *winrm_vars
+
+- name: "[sunshine] Check if Sunshine is already installed"
+  ansible.windows.win_shell: |
+    $installed = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
+                                  "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*" `
+                  -ErrorAction SilentlyContinue |
+                  Where-Object { $_.DisplayName -match 'Sunshine' }
+    if ($installed) {
+      Write-Host "SUNSHINE_INSTALLED=true"
+      Write-Host "Installed version: $($installed.DisplayVersion)"
+      Write-Host "Install location : $($installed.InstallLocation)"
+    } else {
+      Write-Host "SUNSHINE_INSTALLED=false"
+    }
+  register: sunshine_check
+  become: false
+  vars: *winrm_vars
+
+- name: "[sunshine] Show current install status"
+  ansible.builtin.debug:
+    msg: "{{ sunshine_check.stdout_lines | default(['No output']) }}"
+
+- name: "[sunshine] Download Sunshine installer"
+  ansible.windows.win_shell: |
+    $ErrorActionPreference = 'Stop'
+    $info        = Get-Content "C:\Data\sunshine_installer_info.txt"
+    $version     = ($info | Where-Object { $_ -match '^VERSION=' }) -replace '^VERSION=', ''
+    $downloadUrl = ($info | Where-Object { $_ -match '^DOWNLOAD_URL=' }) -replace '^DOWNLOAD_URL=', ''
+
+    $destPath  = "C:\Data\temp\Sunshine-$version-installer.exe"
+    $reinstall = '{{ sunshine_reinstall }}' -eq 'true'
+
+    if ((Test-Path $destPath) -and -not $reinstall) {
+      Write-Host "Installer already downloaded: $destPath"
+    } elseif ((Test-Path $destPath) -and $reinstall) {
+      Write-Host "Reinstall requested — removing old installer..."
+      Remove-Item $destPath -Force
+      Write-Host "Downloading Sunshine $version from: $downloadUrl"
+      $wc = New-Object System.Net.WebClient
+      $wc.DownloadFile($downloadUrl, $destPath)
+      Write-Host "Download complete: $destPath"
+    } else {
+      Write-Host "Downloading Sunshine $version from: $downloadUrl"
+      $wc = New-Object System.Net.WebClient
+      $wc.DownloadFile($downloadUrl, $destPath)
+      Write-Host "Download complete: $destPath"
+    }
+
+    Add-Content "C:\Data\sunshine_installer_info.txt" "LOCAL_PATH=$destPath"
+  become: false
+  vars: *winrm_vars
+  async: 600
+  poll: 15
+  when: >-
+    sunshine_reinstall == 'true' or
+    'SUNSHINE_INSTALLED=false' in (sunshine_check.stdout | default(''))
+
+- name: "[sunshine] Run Sunshine installer (silent)"
+  ansible.windows.win_shell: |
+    $ErrorActionPreference = 'Stop'
+    $info      = Get-Content "C:\Data\sunshine_installer_info.txt"
+    $localPath = ($info | Where-Object { $_ -match '^LOCAL_PATH=' }) -replace '^LOCAL_PATH=', ''
+
+    if (-not (Test-Path $localPath)) {
+      Write-Error "Sunshine installer not found at: $localPath"
+      exit 1
+    }
+
+    Write-Host "Running Sunshine installer (silent)..."
+    # Sunshine uses Inno Setup — /VERYSILENT suppresses all UI
+    $proc = Start-Process -FilePath $localPath `
+      -ArgumentList '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-' `
+      -Wait -PassThru
+
+    Write-Host "Installer exit code: $($proc.ExitCode)"
+    if ($proc.ExitCode -ne 0) {
+      Write-Error "Sunshine installer failed with exit code $($proc.ExitCode)"
+      exit $proc.ExitCode
+    }
+    Write-Host "✅ Sunshine installed successfully"
+  register: sunshine_install_result
+  become: false
+  vars: *winrm_vars
+  async: 300
+  poll: 10
+  when: >-
+    sunshine_reinstall == 'true' or
+    'SUNSHINE_INSTALLED=false' in (sunshine_check.stdout | default(''))
+
+- name: "[sunshine] Show install result"
+  ansible.builtin.debug:
+    msg: "{{ sunshine_install_result.stdout_lines | default(['Skipped — Sunshine already installed']) }}"
+
+# -----------------------------------------------------------------------
+# Configure Sunshine to start automatically and launch the service
+# -----------------------------------------------------------------------
+
+- name: "[sunshine] Configure Sunshine to run as a Windows service"
+  ansible.windows.win_shell: |
+    $sunshineSvc = Get-Service -Name 'SunshineService' -ErrorAction SilentlyContinue
+    if ($sunshineSvc) {
+      Set-Service -Name 'SunshineService' -StartupType Automatic
+      if ($sunshineSvc.Status -ne 'Running') {
+        Start-Service -Name 'SunshineService'
+        Write-Host "✅ SunshineService started and set to Automatic"
+      } else {
+        Write-Host "✅ SunshineService already running (Automatic)"
+      }
+    } else {
+      # Sunshine may register as a different service name — check common names
+      $altSvc = Get-Service | Where-Object { $_.DisplayName -match 'Sunshine' } | Select-Object -First 1
+      if ($altSvc) {
+        Set-Service -Name $altSvc.Name -StartupType Automatic
+        if ($altSvc.Status -ne 'Running') {
+          Start-Service -Name $altSvc.Name
+          Write-Host "✅ $($altSvc.DisplayName) started and set to Automatic"
+        } else {
+          Write-Host "✅ $($altSvc.DisplayName) already running (Automatic)"
+        }
+      } else {
+        Write-Host "⚠️  No Sunshine service found — Sunshine may need to be started manually from the Start Menu"
+        Write-Host "   Or configure it via: https://localhost:47990 on the VM"
+      }
+    }
+  register: sunshine_svc_result
+  become: false
+  vars: *winrm_vars
+
+- name: "[sunshine] Show service status"
+  ansible.builtin.debug:
+    msg: "{{ sunshine_svc_result.stdout_lines | default(['No output']) }}"
+
+# -----------------------------------------------------------------------
+# Verify Sunshine is accessible
+# -----------------------------------------------------------------------
+
+- name: "[sunshine] Verify Sunshine is listening on expected ports"
+  ansible.windows.win_shell: |
+    Write-Host "=== Sunshine Listening Ports ==="
+    $ports = @(47984, 47989, 47990, 48010)
+    foreach ($port in $ports) {
+      $listener = Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue
+      if ($listener) {
+        $proc = Get-Process -Id $listener.OwningProcess -ErrorAction SilentlyContinue
+        Write-Host "  TCP $port : LISTENING ($($proc.ProcessName))"
+      } else {
+        Write-Host "  TCP $port : not listening"
+      }
+    }
+
+    Write-Host "`n=== Sunshine Install Location ==="
+    $reg = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
+                            "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*" `
+             -ErrorAction SilentlyContinue |
+             Where-Object { $_.DisplayName -match 'Sunshine' }
+    if ($reg) {
+      Write-Host "  Name    : $($reg.DisplayName)"
+      Write-Host "  Version : $($reg.DisplayVersion)"
+      Write-Host "  Location: $($reg.InstallLocation)"
+    }
+
+    Write-Host "`n=== Sunshine Firewall Rules ==="
+    Get-NetFirewallRule -DisplayName 'Sunshine*' -ErrorAction SilentlyContinue |
+      Select-Object DisplayName, Enabled, Direction, Action | Format-Table -AutoSize
+  register: sunshine_verify_result
+  become: false
+  vars: *winrm_vars
+
+- name: "[sunshine] Show verification"
+  ansible.builtin.debug:
+    msg: "{{ sunshine_verify_result.stdout_lines | default(['No output']) }}"
+
+# -----------------------------------------------------------------------
+# Cleanup
+# -----------------------------------------------------------------------
+
+- name: "[sunshine] Clean up downloaded installer"
+  ansible.windows.win_shell: |
+    $info = Get-Content "C:\Data\sunshine_installer_info.txt" -ErrorAction SilentlyContinue
+    $localPath = ($info | Where-Object { $_ -match '^LOCAL_PATH=' }) -replace '^LOCAL_PATH=', ''
+    if ($localPath -and (Test-Path $localPath)) {
+      Remove-Item $localPath -Force
+      Write-Host "Removed: $localPath"
+    }
+    Remove-Item "C:\Data\sunshine_installer_info.txt" -Force -ErrorAction SilentlyContinue
+  become: false
+  vars: *winrm_vars
+  ignore_errors: true
+
+# -----------------------------------------------------------------------
+# Teardown — stop port-forward
+# -----------------------------------------------------------------------
+- name: Stop WinRM port-forward
+  ansible.builtin.shell: |
+    if [ -f /tmp/winrm-pf.pid ]; then
+      kill $(cat /tmp/winrm-pf.pid) 2>/dev/null || true
+      rm -f /tmp/winrm-pf.pid
+    fi
+    pkill -f "kubectl.*port-forward.*5985" 2>/dev/null || true
+  ignore_errors: true
+
+# -----------------------------------------------------------------------
+# Summary
+# -----------------------------------------------------------------------
+- name: Display Sunshine install summary
+  ansible.builtin.debug:
+    msg:
+      - "✅ Sunshine streaming server install complete"
+      - "   VM         : {{ vm_name }} ({{ kubevirt_namespace }})"
+      - "   Host       : {{ win_hostname.stdout | default('unknown') | trim }}"
+      - "   Version    : {{ sunshine_version }}"
+      - ""
+      - "Next steps:"
+      - "  1. Open https://192.168.100.10:47990 in a browser to set Sunshine username/password"
+      - "  2. Install Moonlight on your client device"
+      - "  3. Add host 192.168.100.10 in Moonlight"
+      - "  4. Pair using the PIN shown in Moonlight → enter it in Sunshine web UI"
+      - "  5. Stream!"
